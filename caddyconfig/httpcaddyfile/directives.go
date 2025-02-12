@@ -17,6 +17,7 @@ package httpcaddyfile
 import (
 	"encoding/json"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,21 +28,33 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
-// directiveOrder specifies the order
-// to apply directives in HTTP routes.
+// defaultDirectiveOrder specifies the default order
+// to apply directives in HTTP routes. This must only
+// consist of directives that are included in Caddy's
+// standard distribution.
 //
-// The root directive goes first in case rewrites or
-// redirects depend on existence of files, i.e. the
-// file matcher, which must know the root first.
+// e.g. The 'root' directive goes near the start in
+// case rewrites or redirects depend on existence of
+// files, i.e. the file matcher, which must know the
+// root first.
 //
-// The header directive goes second so that headers
-// can be manipulated before doing redirects.
-var directiveOrder = []string{
+// e.g. The 'header' directive goes before 'redir' so
+// that headers can be manipulated before doing redirects.
+//
+// e.g. The 'respond' directive is near the end because it
+// writes a response and terminates the middleware chain.
+var defaultDirectiveOrder = []string{
 	"tracing",
 
+	// set variables that may be used by other directives
 	"map",
 	"vars",
+	"fs",
 	"root",
+	"log_append",
+	"skip_log", // TODO: deprecated, renamed to log_skip
+	"log_skip",
+	"log_name",
 
 	"header",
 	"copy_response_headers", // only in reverse_proxy's handle_response
@@ -56,14 +69,17 @@ var directiveOrder = []string{
 	"try_files",
 
 	// middleware handlers; some wrap responses
-	"basicauth",
+	"basicauth", // TODO: deprecated, renamed to basic_auth
+	"basic_auth",
 	"forward_auth",
 	"request_header",
 	"encode",
 	"push",
+	"intercept",
 	"templates",
 
 	// special routing & dispatching directives
+	"invoke",
 	"handle",
 	"handle_path",
 	"route",
@@ -80,16 +96,10 @@ var directiveOrder = []string{
 	"acme_server",
 }
 
-// directiveIsOrdered returns true if dir is
-// a known, ordered (sorted) directive.
-func directiveIsOrdered(dir string) bool {
-	for _, d := range directiveOrder {
-		if d == dir {
-			return true
-		}
-	}
-	return false
-}
+// directiveOrder specifies the order to apply directives
+// in HTTP routes, after being modified by either the
+// plugins or by the user via the "order" global option.
+var directiveOrder = defaultDirectiveOrder
 
 // RegisterDirective registers a unique directive dir with an
 // associated unmarshaling (setup) function. When directive dir
@@ -126,6 +136,53 @@ func RegisterHandlerDirective(dir string, setupFunc UnmarshalHandlerFunc) {
 	})
 }
 
+// RegisterDirectiveOrder registers the default order for a
+// directive from a plugin.
+//
+// This is useful when a plugin has a well-understood place
+// it should run in the middleware pipeline, and it allows
+// users to avoid having to define the order themselves.
+//
+// The directive dir may be placed in the position relative
+// to ('before' or 'after') a directive included in Caddy's
+// standard distribution. It cannot be relative to another
+// plugin's directive.
+//
+// EXPERIMENTAL: This API may change or be removed.
+func RegisterDirectiveOrder(dir string, position Positional, standardDir string) {
+	// check if directive was already ordered
+	if slices.Contains(directiveOrder, dir) {
+		panic("directive '" + dir + "' already ordered")
+	}
+
+	if position != Before && position != After {
+		panic("the 2nd argument must be either 'before' or 'after', got '" + position + "'")
+	}
+
+	// check if directive exists in standard distribution, since
+	// we can't allow plugins to depend on one another; we can't
+	// guarantee the order that plugins are loaded in.
+	foundStandardDir := slices.Contains(defaultDirectiveOrder, standardDir)
+	if !foundStandardDir {
+		panic("the 3rd argument '" + standardDir + "' must be a directive that exists in the standard distribution of Caddy")
+	}
+
+	// insert directive into proper position
+	newOrder := directiveOrder
+	for i, d := range newOrder {
+		if d != standardDir {
+			continue
+		}
+		if position == Before {
+			newOrder = append(newOrder[:i], append([]string{dir}, newOrder[i:]...)...)
+		} else if position == After {
+			newOrder = append(newOrder[:i+1], append([]string{dir}, newOrder[i+1:]...)...)
+		}
+		break
+	}
+	directiveOrder = newOrder
+}
+
 // RegisterGlobalOption registers a unique global option opt with
 // an associated unmarshaling (setup) function. When the global
 // option opt is encountered in a Caddyfile, setupFunc will be
@@ -142,8 +199,8 @@ func RegisterGlobalOption(opt string, setupFunc UnmarshalGlobalFunc) {
 type Helper struct {
 	*caddyfile.Dispenser
 	// State stores intermediate variables during caddyfile adaptation.
-	State        map[string]interface{}
-	options      map[string]interface{}
+	State        map[string]any
+	options      map[string]any
 	warnings     *[]caddyconfig.Warning
 	matcherDefs  map[string]caddy.ModuleMap
 	parentBlock  caddyfile.ServerBlock
@@ -151,7 +208,7 @@ type Helper struct {
 }
 
 // Option gets the option keyed by name.
-func (h Helper) Option(name string) interface{} {
+func (h Helper) Option(name string) any {
 	return h.options[name]
 }
 
@@ -171,11 +228,12 @@ func (h Helper) Caddyfiles() []string {
 	for file := range files {
 		filesSlice = append(filesSlice, file)
 	}
+	sort.Strings(filesSlice)
 	return filesSlice
 }
 
 // JSON converts val into JSON. Any errors are added to warnings.
-func (h Helper) JSON(val interface{}) json.RawMessage {
+func (h Helper) JSON(val any) json.RawMessage {
 	return caddyconfig.JSON(val, h.warnings)
 }
 
@@ -214,7 +272,8 @@ func (h Helper) ExtractMatcherSet() (caddy.ModuleMap, error) {
 
 // NewRoute returns config values relevant to creating a new HTTP route.
 func (h Helper) NewRoute(matcherSet caddy.ModuleMap,
-	handler caddyhttp.MiddlewareHandler) []ConfigValue {
+	handler caddyhttp.MiddlewareHandler,
+) []ConfigValue {
 	mod, err := caddy.GetModule(caddy.GetModuleID(handler))
 	if err != nil {
 		*h.warnings = append(*h.warnings, caddyconfig.Warning{
@@ -266,12 +325,6 @@ func (h Helper) GroupRoutes(vals []ConfigValue) {
 	}
 }
 
-// NewBindAddresses returns config values relevant to adding
-// listener bind addresses to the config.
-func (h Helper) NewBindAddresses(addrs []string) []ConfigValue {
-	return []ConfigValue{{Class: "bind", Value: addrs}}
-}
-
 // WithDispenser returns a new instance based on d. All others Helper
 // fields are copied, so typically maps are shared with this new instance.
 func (h Helper) WithDispenser(d *caddyfile.Dispenser) Helper {
@@ -288,7 +341,7 @@ func ParseSegmentAsSubroute(h Helper) (caddyhttp.MiddlewareHandler, error) {
 		return nil, err
 	}
 
-	return buildSubroute(allResults, h.groupCounter)
+	return buildSubroute(allResults, h.groupCounter, true)
 }
 
 // parseSegmentAsConfig parses the segment such that its subdirectives
@@ -375,7 +428,7 @@ type ConfigValue struct {
 	// The value to be used when building the config.
 	// Generally its type is associated with the
 	// name of the Class.
-	Value interface{}
+	Value any
 
 	directive string
 }
@@ -406,7 +459,7 @@ func sortRoutes(routes []ConfigValue) {
 			return false
 		}
 
-		// decode the path matchers, if there is just one of them
+		// decode the path matchers if there is just one matcher set
 		var iPM, jPM caddyhttp.MatchPath
 		if len(iRoute.MatcherSetsRaw) == 1 {
 			_ = json.Unmarshal(iRoute.MatcherSetsRaw[0]["path"], &iPM)
@@ -415,39 +468,47 @@ func sortRoutes(routes []ConfigValue) {
 			_ = json.Unmarshal(jRoute.MatcherSetsRaw[0]["path"], &jPM)
 		}
 
-		// sort by longer path (more specific) first; missing path
-		// matchers or multi-matchers are treated as zero-length paths
+		// if there is only one path in the path matcher, sort by longer path
+		// (more specific) first; missing path matchers or multi-matchers are
+		// treated as zero-length paths
 		var iPathLen, jPathLen int
-		if len(iPM) > 0 {
+		if len(iPM) == 1 {
 			iPathLen = len(iPM[0])
 		}
-		if len(jPM) > 0 {
+		if len(jPM) == 1 {
 			jPathLen = len(jPM[0])
 		}
 
+		sortByPath := func() bool {
+			// we can only confidently compare path lengths if both
+			// directives have a single path to match (issue #5037)
+			if iPathLen > 0 && jPathLen > 0 {
+				// if both paths are the same except for a trailing wildcard,
+				// sort by the shorter path first (which is more specific)
+				if strings.TrimSuffix(iPM[0], "*") == strings.TrimSuffix(jPM[0], "*") {
+					return iPathLen < jPathLen
+				}
+
+				// sort most-specific (longest) path first
+				return iPathLen > jPathLen
+			}
+
+			// if both directives don't have a single path to compare,
+			// sort whichever one has a matcher first; if both have
+			// a matcher, sort equally (stable sort preserves order)
+			return len(iRoute.MatcherSetsRaw) > 0 && len(jRoute.MatcherSetsRaw) == 0
+		}()
+
 		// some directives involve setting values which can overwrite
-		// eachother, so it makes most sense to reverse the order so
-		// that the lease specific matcher is first; everything else
-		// has most-specific matcher first
+		// each other, so it makes most sense to reverse the order so
+		// that the least-specific matcher is first, allowing the last
+		// matching one to win
 		if iDir == "vars" {
-			// if both directives have no path matcher, use whichever one
-			// has no matcher first.
-			if iPathLen == 0 && jPathLen == 0 {
-				return len(iRoute.MatcherSetsRaw) == 0 && len(jRoute.MatcherSetsRaw) > 0
-			}
-
-			// sort with the least-specific (shortest) path first
-			return iPathLen < jPathLen
-		} else {
-			// if both directives have no path matcher, use whichever one
-			// has any kind of matcher defined first.
-			if iPathLen == 0 && jPathLen == 0 {
-				return len(iRoute.MatcherSetsRaw) > 0 && len(jRoute.MatcherSetsRaw) == 0
-			}
-
-			// sort with the most-specific (longest) path first
-			return iPathLen > jPathLen
+			return !sortByPath
 		}
+
+		// everything else is most-specific matcher first
+		return sortByPath
 	})
 }
 
@@ -455,9 +516,9 @@ func sortRoutes(routes []ConfigValue) {
 // a "pile" of config values, keyed by class name,
 // as well as its parsed keys for convenience.
 type serverBlock struct {
-	block caddyfile.ServerBlock
-	pile  map[string][]ConfigValue // config values obtained from directives
-	keys  []Address
+	block      caddyfile.ServerBlock
+	pile       map[string][]ConfigValue // config values obtained from directives
+	parsedKeys []Address
 }
 
 // hostsFromKeys returns a list of all the non-empty hostnames found in
@@ -474,7 +535,7 @@ type serverBlock struct {
 func (sb serverBlock) hostsFromKeys(loggerMode bool) []string {
 	// ensure each entry in our list is unique
 	hostMap := make(map[string]struct{})
-	for _, addr := range sb.keys {
+	for _, addr := range sb.parsedKeys {
 		if addr.Host == "" {
 			if !loggerMode {
 				// server block contains a key like ":443", i.e. the host portion
@@ -506,7 +567,7 @@ func (sb serverBlock) hostsFromKeys(loggerMode bool) []string {
 func (sb serverBlock) hostsFromKeysNotHTTP(httpPort string) []string {
 	// ensure each entry in our list is unique
 	hostMap := make(map[string]struct{})
-	for _, addr := range sb.keys {
+	for _, addr := range sb.parsedKeys {
 		if addr.Host == "" {
 			continue
 		}
@@ -527,24 +588,28 @@ func (sb serverBlock) hostsFromKeysNotHTTP(httpPort string) []string {
 // hasHostCatchAllKey returns true if sb has a key that
 // omits a host portion, i.e. it "catches all" hosts.
 func (sb serverBlock) hasHostCatchAllKey() bool {
-	for _, addr := range sb.keys {
-		if addr.Host == "" {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(sb.parsedKeys, func(addr Address) bool {
+		return addr.Host == ""
+	})
 }
 
 // isAllHTTP returns true if all sb keys explicitly specify
 // the http:// scheme
 func (sb serverBlock) isAllHTTP() bool {
-	for _, addr := range sb.keys {
-		if addr.Scheme != "http" {
-			return false
-		}
-	}
-	return true
+	return !slices.ContainsFunc(sb.parsedKeys, func(addr Address) bool {
+		return addr.Scheme != "http"
+	})
 }
+
+// Positional are the supported modes for ordering directives.
+type Positional string
+
+const (
+	Before Positional = "before"
+	After  Positional = "after"
+	First  Positional = "first"
+	Last   Positional = "last"
+)
 
 type (
 	// UnmarshalFunc is a function which can unmarshal Caddyfile
@@ -567,7 +632,7 @@ type (
 	// tokens from a global option. It is passed the tokens to parse and
 	// existing value from the previous instance of this global option
 	// (if any). It returns the value to associate with this global option.
-	UnmarshalGlobalFunc func(d *caddyfile.Dispenser, existingVal interface{}) (interface{}, error)
+	UnmarshalGlobalFunc func(d *caddyfile.Dispenser, existingVal any) (any, error)
 )
 
 var registeredDirectives = make(map[string]UnmarshalFunc)

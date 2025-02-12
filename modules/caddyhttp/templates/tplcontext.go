@@ -18,10 +18,13 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,22 +32,24 @@ import (
 	"time"
 
 	"github.com/Masterminds/sprig/v3"
-	"github.com/alecthomas/chroma/formatters/html"
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	chromahtml "github.com/alecthomas/chroma/v2/formatters/html"
 	"github.com/dustin/go-humanize"
 	"github.com/yuin/goldmark"
-	highlighting "github.com/yuin/goldmark-highlighting"
+	highlighting "github.com/yuin/goldmark-highlighting/v2"
 	"github.com/yuin/goldmark/extension"
 	"github.com/yuin/goldmark/parser"
 	gmhtml "github.com/yuin/goldmark/renderer/html"
+	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 // TemplateContext is the TemplateContext with which HTTP templates are executed.
 type TemplateContext struct {
 	Root        http.FileSystem
 	Req         *http.Request
-	Args        []interface{} // defined by arguments to funcInclude
+	Args        []any // defined by arguments to funcInclude
 	RespHeader  WrappedHeader
 	CustomFuncs []template.FuncMap // functions added by plugins
 
@@ -55,7 +60,7 @@ type TemplateContext struct {
 // NewTemplate returns a new template intended to be evaluated with this
 // context, as it is initialized with configuration from this context.
 func (c *TemplateContext) NewTemplate(tplName string) *template.Template {
-	c.tpl = template.New(tplName)
+	c.tpl = template.New(tplName).Option("missingkey=zero")
 
 	// customize delimiters, if applicable
 	if c.config != nil && len(c.config.Delimiters) == 2 {
@@ -73,17 +78,22 @@ func (c *TemplateContext) NewTemplate(tplName string) *template.Template {
 	// add our own library
 	c.tpl.Funcs(template.FuncMap{
 		"include":          c.funcInclude,
+		"readFile":         c.funcReadFile,
 		"import":           c.funcImport,
 		"httpInclude":      c.funcHTTPInclude,
 		"stripHTML":        c.funcStripHTML,
 		"markdown":         c.funcMarkdown,
 		"splitFrontMatter": c.funcSplitFrontMatter,
 		"listFiles":        c.funcListFiles,
+		"fileStat":         c.funcFileStat,
 		"env":              c.funcEnv,
 		"placeholder":      c.funcPlaceholder,
+		"ph":               c.funcPlaceholder, // shortcut
 		"fileExists":       c.funcFileExists,
 		"httpError":        c.funcHTTPError,
 		"humanize":         c.funcHumanize,
+		"maybe":            c.funcMaybe,
+		"pathEscape":       url.PathEscape,
 	})
 	return c.tpl
 }
@@ -99,14 +109,12 @@ func (c TemplateContext) OriginalReq() http.Request {
 // Note that included files are NOT escaped, so you should only include
 // trusted files. If it is not trusted, be sure to use escaping functions
 // in your template.
-func (c TemplateContext) funcInclude(filename string, args ...interface{}) (string, error) {
-
+func (c TemplateContext) funcInclude(filename string, args ...any) (string, error) {
 	bodyBuf := bufPool.Get().(*bytes.Buffer)
 	bodyBuf.Reset()
 	defer bufPool.Put(bodyBuf)
 
 	err := c.readFileToBuffer(filename, bodyBuf)
-
 	if err != nil {
 		return "", err
 	}
@@ -114,6 +122,23 @@ func (c TemplateContext) funcInclude(filename string, args ...interface{}) (stri
 	c.Args = args
 
 	err = c.executeTemplateInBuffer(filename, bodyBuf)
+	if err != nil {
+		return "", err
+	}
+
+	return bodyBuf.String(), nil
+}
+
+// funcReadFile returns the contents of a filename relative to the site root.
+// Note that included files are NOT escaped, so you should only include
+// trusted files. If it is not trusted, be sure to use escaping functions
+// in your template.
+func (c TemplateContext) funcReadFile(filename string) (string, error) {
+	bodyBuf := bufPool.Get().(*bytes.Buffer)
+	bodyBuf.Reset()
+	defer bufPool.Put(bodyBuf)
+
+	err := c.readFileToBuffer(filename, bodyBuf)
 	if err != nil {
 		return "", err
 	}
@@ -169,6 +194,7 @@ func (c TemplateContext) funcHTTPInclude(uri string) (string, error) {
 		return "", err
 	}
 	virtReq.Host = c.Req.Host
+	virtReq.RemoteAddr = "127.0.0.1:10000" // https://github.com/caddyserver/caddy/issues/5835
 	virtReq.Header = c.Req.Header.Clone()
 	virtReq.Header.Set("Accept-Encoding", "identity") // https://github.com/caddyserver/caddy/issues/4352
 	virtReq.Trailer = c.Req.Trailer.Clone()
@@ -195,7 +221,6 @@ func (c TemplateContext) funcHTTPInclude(uri string) (string, error) {
 // {{ template }} from the standard template library. If the imported file has
 // no {{ define }} blocks, the name of the import will be the path
 func (c *TemplateContext) funcImport(filename string) (string, error) {
-
 	bodyBuf := bufPool.Get().(*bytes.Buffer)
 	bodyBuf.Reset()
 	defer bufPool.Put(bodyBuf)
@@ -227,6 +252,12 @@ func (c *TemplateContext) executeTemplateInBuffer(tplName string, buf *bytes.Buf
 
 func (c TemplateContext) funcPlaceholder(name string) string {
 	repl := c.Req.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+
+	// For safety, we don't want to allow the file placeholder in
+	// templates because it could be used to read arbitrary files
+	// if the template contents were not trusted.
+	repl = repl.WithoutFile()
+
 	value, _ := repl.GetString(name)
 	return value
 }
@@ -235,7 +266,7 @@ func (TemplateContext) funcEnv(varName string) string {
 	return os.Getenv(varName)
 }
 
-// Cookie gets the value of a cookie with name name.
+// Cookie gets the value of a cookie with name.
 func (c TemplateContext) Cookie(name string) string {
 	cookies := c.Req.Cookies()
 	for _, cookie := range cookies {
@@ -246,13 +277,25 @@ func (c TemplateContext) Cookie(name string) string {
 	return ""
 }
 
-// RemoteIP gets the IP address of the client making the request.
+// RemoteIP gets the IP address of the connection's remote IP.
 func (c TemplateContext) RemoteIP() string {
 	ip, _, err := net.SplitHostPort(c.Req.RemoteAddr)
 	if err != nil {
 		return c.Req.RemoteAddr
 	}
 	return ip
+}
+
+// ClientIP gets the IP address of the real client making the request
+// if the request is trusted (see trusted_proxies), otherwise returns
+// the connection's remote IP.
+func (c TemplateContext) ClientIP() string {
+	address := caddyhttp.GetVar(c.Req.Context(), caddyhttp.ClientIPVarKey).(string)
+	clientIP, _, err := net.SplitHostPort(address)
+	if err != nil {
+		clientIP = address // no port
+	}
+	return clientIP
 }
 
 // Host returns the hostname portion of the Host header
@@ -304,8 +347,8 @@ func (TemplateContext) funcStripHTML(s string) string {
 
 // funcMarkdown renders the markdown body as HTML. The resulting
 // HTML is NOT escaped so that it can be rendered as HTML.
-func (TemplateContext) funcMarkdown(input interface{}) (string, error) {
-	inputStr := toString(input)
+func (TemplateContext) funcMarkdown(input any) (string, error) {
+	inputStr := caddy.ToString(input)
 
 	md := goldmark.New(
 		goldmark.WithExtensions(
@@ -313,7 +356,7 @@ func (TemplateContext) funcMarkdown(input interface{}) (string, error) {
 			extension.Footnote,
 			highlighting.NewHighlighting(
 				highlighting.WithFormatOptions(
-					html.WithClasses(true),
+					chromahtml.WithClasses(true),
 				),
 			),
 		),
@@ -340,8 +383,8 @@ func (TemplateContext) funcMarkdown(input interface{}) (string, error) {
 // splitFrontMatter parses front matter out from the beginning of input,
 // and returns the separated key-value pairs and the body/content. input
 // must be a "stringy" value.
-func (TemplateContext) funcSplitFrontMatter(input interface{}) (parsedMarkdownDoc, error) {
-	meta, body, err := extractFrontMatter(toString(input))
+func (TemplateContext) funcSplitFrontMatter(input any) (parsedMarkdownDoc, error) {
+	meta, body, err := extractFrontMatter(caddy.ToString(input))
 	if err != nil {
 		return parsedMarkdownDoc{}, err
 	}
@@ -395,9 +438,32 @@ func (c TemplateContext) funcFileExists(filename string) (bool, error) {
 	return false, nil
 }
 
+// funcFileStat returns Stat of a filename
+func (c TemplateContext) funcFileStat(filename string) (fs.FileInfo, error) {
+	if c.Root == nil {
+		return nil, fmt.Errorf("root file system not specified")
+	}
+
+	file, err := c.Root.Open(path.Clean(filename))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	return file.Stat()
+}
+
 // funcHTTPError returns a structured HTTP handler error. EXPERIMENTAL; SUBJECT TO CHANGE.
 // Example usage: `{{if not (fileExists $includeFile)}}{{httpError 404}}{{end}}`
 func (c TemplateContext) funcHTTPError(statusCode int) (bool, error) {
+	// Delete some headers that may have been set by the underlying
+	// handler (such as file_server) which may break the error response.
+	c.RespHeader.Header.Del("Content-Length")
+	c.RespHeader.Header.Del("Content-Type")
+	c.RespHeader.Header.Del("Etag")
+	c.RespHeader.Header.Del("Last-Modified")
+	c.RespHeader.Header.Del("Accept-Ranges")
+
 	return false, caddyhttp.Error(statusCode, nil)
 }
 
@@ -438,6 +504,51 @@ func (c TemplateContext) funcHumanize(formatType, data string) (string, error) {
 	return "", fmt.Errorf("no know function was given")
 }
 
+// funcMaybe invokes the plugged-in function named functionName if it is plugged in
+// (is a module in the 'http.handlers.templates.functions' namespace). If it is not
+// available, a log message is emitted.
+//
+// The first argument is the function name, and the rest of the arguments are
+// passed on to the actual function.
+//
+// This function is useful for executing templates that use components that may be
+// considered as optional in some cases (like during local development) where you do
+// not want to require everyone to have a custom Caddy build to be able to execute
+// your template.
+//
+// NOTE: This function is EXPERIMENTAL and subject to change or removal.
+func (c TemplateContext) funcMaybe(functionName string, args ...any) (any, error) {
+	for _, funcMap := range c.CustomFuncs {
+		if fn, ok := funcMap[functionName]; ok {
+			val := reflect.ValueOf(fn)
+			if val.Kind() != reflect.Func {
+				continue
+			}
+			argVals := make([]reflect.Value, len(args))
+			for i, arg := range args {
+				argVals[i] = reflect.ValueOf(arg)
+			}
+			returnVals := val.Call(argVals)
+			switch len(returnVals) {
+			case 0:
+				return "", nil
+			case 1:
+				return returnVals[0].Interface(), nil
+			case 2:
+				var err error
+				if !returnVals[1].IsNil() {
+					err = returnVals[1].Interface().(error)
+				}
+				return returnVals[0].Interface(), err
+			default:
+				return nil, fmt.Errorf("maybe %s: invalid number of return values: %d", functionName, len(returnVals))
+			}
+		}
+	}
+	c.config.logger.Named("maybe").Warn("template function could not be found; ignoring invocation", zap.String("name", functionName))
+	return "", nil
+}
+
 // WrappedHeader wraps niladic functions so that they
 // can be used in templates. (Template functions must
 // return a value.)
@@ -465,21 +576,8 @@ func (h WrappedHeader) Del(field string) string {
 	return ""
 }
 
-func toString(input interface{}) string {
-	switch v := input.(type) {
-	case string:
-		return v
-	case fmt.Stringer:
-		return v.String()
-	case error:
-		return v.Error()
-	default:
-		return fmt.Sprintf("%v", input)
-	}
-}
-
 var bufPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(bytes.Buffer)
 	},
 }

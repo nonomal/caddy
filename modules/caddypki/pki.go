@@ -17,8 +17,9 @@ package caddypki
 import (
 	"fmt"
 
-	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 func init() {
@@ -54,7 +55,7 @@ func (PKI) CaddyModule() caddy.ModuleInfo {
 // Provision sets up the configuration for the PKI app.
 func (p *PKI) Provision(ctx caddy.Context) error {
 	p.ctx = ctx
-	p.log = ctx.Logger(p)
+	p.log = ctx.Logger()
 
 	for caID, ca := range p.CAs {
 		err := ca.Provision(ctx, caID, p.log)

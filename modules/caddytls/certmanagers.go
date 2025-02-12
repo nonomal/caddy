@@ -9,11 +9,13 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/certmagic"
 	"github.com/tailscale/tscert"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
 func init() {
@@ -23,14 +25,6 @@ func init() {
 
 // Tailscale is a module that can get certificates from the local Tailscale process.
 type Tailscale struct {
-	// If true, this module will operate in "best-effort" mode and
-	// ignore "soft" errors; i.e. try Tailscale, and if it doesn't connect
-	// or return a certificate, oh well. Failure to connect to Tailscale
-	// results in a no-op instead of an error. Intended for the use case
-	// where this module is added implicitly for convenience, even if
-	// Tailscale isn't necessarily running.
-	Optional bool `json:"optional,omitempty"`
-
 	logger *zap.Logger
 }
 
@@ -43,7 +37,7 @@ func (Tailscale) CaddyModule() caddy.ModuleInfo {
 }
 
 func (ts *Tailscale) Provision(ctx caddy.Context) error {
-	ts.logger = ctx.Logger(ts)
+	ts.logger = ctx.Logger()
 	return nil
 }
 
@@ -53,21 +47,20 @@ func (ts Tailscale) GetCertificate(ctx context.Context, hello *tls.ClientHelloIn
 		return nil, nil // pass-thru: Tailscale can't offer a cert for this name
 	}
 	if err != nil {
-		ts.logger.Warn("could not get status; will try to get certificate anyway", zap.Error(err))
+		if c := ts.logger.Check(zapcore.WarnLevel, "could not get status; will try to get certificate anyway"); c != nil {
+			c.Write(zap.Error(err))
+		}
 	}
-	return tscert.GetCertificate(hello)
+	return tscert.GetCertificateWithContext(ctx, hello)
 }
 
 // canHazCertificate returns true if Tailscale reports it can get a certificate for the given ClientHello.
 func (ts Tailscale) canHazCertificate(ctx context.Context, hello *tls.ClientHelloInfo) (bool, error) {
-	if ts.Optional && !strings.HasSuffix(strings.ToLower(hello.ServerName), tailscaleDomainAliasEnding) {
+	if !strings.HasSuffix(strings.ToLower(hello.ServerName), tailscaleDomainAliasEnding) {
 		return false, nil
 	}
 	status, err := tscert.GetStatus(ctx)
 	if err != nil {
-		if ts.Optional {
-			return false, nil // ignore error if we don't expect/require it to work anyway
-		}
 		return false, err
 	}
 	for _, domain := range status.CertDomains {
@@ -80,13 +73,11 @@ func (ts Tailscale) canHazCertificate(ctx context.Context, hello *tls.ClientHell
 
 // UnmarshalCaddyfile deserializes Caddyfile tokens into ts.
 //
-//     ... tailscale
-//
+//	... tailscale
 func (Tailscale) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if d.NextArg() {
-			return d.ArgErr()
-		}
+	d.Next() // consume cert manager name
+	if d.NextArg() {
+		return d.ArgErr()
 	}
 	return nil
 }
@@ -108,6 +99,11 @@ type HTTPCertGetter struct {
 	// To be valid, the response must be HTTP 200 with a PEM body
 	// consisting of blocks for the certificate chain and the private
 	// key.
+	//
+	// To indicate that this manager is not managing a certificate for
+	// the described handshake, the endpoint should return HTTP 204
+	// (No Content). Error statuses will indicate that the manager is
+	// capable of providing a certificate but was unable to.
 	URL string `json:"url,omitempty"`
 
 	ctx context.Context
@@ -159,6 +155,10 @@ func (hcg HTTPCertGetter) GetCertificate(ctx context.Context, hello *tls.ClientH
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		// endpoint is not managing certs for this handshake
+		return nil, nil
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("got HTTP %d", resp.StatusCode)
 	}
@@ -178,20 +178,20 @@ func (hcg HTTPCertGetter) GetCertificate(ctx context.Context, hello *tls.ClientH
 
 // UnmarshalCaddyfile deserializes Caddyfile tokens into ts.
 //
-//     ... http <url>
-//
+//	... http <url>
 func (hcg *HTTPCertGetter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if !d.NextArg() {
-			return d.ArgErr()
-		}
-		hcg.URL = d.Val()
-		if d.NextArg() {
-			return d.ArgErr()
-		}
-		for nesting := d.Nesting(); d.NextBlock(nesting); {
-			return d.Err("block not allowed here")
-		}
+	d.Next() // consume cert manager name
+
+	if !d.NextArg() {
+		return d.ArgErr()
+	}
+	hcg.URL = d.Val()
+
+	if d.NextArg() {
+		return d.ArgErr()
+	}
+	if d.NextBlock(0) {
+		return d.Err("block not allowed here")
 	}
 	return nil
 }
