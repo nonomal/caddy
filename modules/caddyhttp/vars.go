@@ -18,6 +18,11 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"reflect"
+	"strings"
+
+	"github.com/google/cel-go/cel"
+	"github.com/google/cel-go/common/types/ref"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -37,7 +42,7 @@ func init() {
 //
 // The key is the variable name, and the value is the value of the
 // variable. Both the name and value may use or contain placeholders.
-type VarsMiddleware map[string]interface{}
+type VarsMiddleware map[string]any
 
 // CaddyModule returns the Caddy module information.
 func (VarsMiddleware) CaddyModule() caddy.ModuleInfo {
@@ -48,7 +53,7 @@ func (VarsMiddleware) CaddyModule() caddy.ModuleInfo {
 }
 
 func (m VarsMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next Handler) error {
-	vars := r.Context().Value(VarsCtxKey).(map[string]interface{})
+	vars := r.Context().Value(VarsCtxKey).(map[string]any)
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 	for k, v := range m {
 		keyExpanded := repl.ReplaceAll(k, "")
@@ -56,18 +61,25 @@ func (m VarsMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next H
 			v = repl.ReplaceAll(valStr, "")
 		}
 		vars[keyExpanded] = v
+
+		// Special case: the user ID is in the replacer, pulled from there
+		// for access logs. Allow users to override it with the vars handler.
+		if keyExpanded == "http.auth.user.id" {
+			repl.Set(keyExpanded, v)
+		}
 	}
 	return next.ServeHTTP(w, r)
 }
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler. Syntax:
 //
-//     vars [<name> <val>] {
-//         <name> <val>
-//         ...
-//     }
-//
+//	vars [<name> <val>] {
+//	    <name> <val>
+//	    ...
+//	}
 func (m *VarsMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	d.Next() // consume directive name
+
 	if *m == nil {
 		*m = make(VarsMiddleware)
 	}
@@ -94,14 +106,12 @@ func (m *VarsMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		return nil
 	}
 
-	for d.Next() {
-		if err := nextVar(true); err != nil {
+	if err := nextVar(true); err != nil {
+		return err
+	}
+	for d.NextBlock(0) {
+		if err := nextVar(false); err != nil {
 			return err
-		}
-		for nesting := d.Nesting(); d.NextBlock(nesting); {
-			if err := nextVar(false); err != nil {
-				return err
-			}
 		}
 	}
 
@@ -109,14 +119,17 @@ func (m *VarsMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 }
 
 // VarsMatcher is an HTTP request matcher which can match
-// requests based on variables in the context. The key is
-// the name of the variable, and the values are possible
-// values the variable can be in order to match (OR'ed).
+// requests based on variables in the context or placeholder
+// values. The key is the placeholder or name of the variable,
+// and the values are possible values the variable can be in
+// order to match (logical OR'ed).
 //
-// As a special case, this matcher can also match on
-// placeholders generally. If the key is not an HTTP chain
-// variable, it will be checked to see if it is a
-// placeholder name, and if so, will compare its value.
+// If the key is surrounded by `{ }` it is assumed to be a
+// placeholder. Otherwise, it will be considered a variable
+// name.
+//
+// Placeholders in the keys are not expanded, but
+// placeholders in the values are.
 type VarsMatcher map[string][]string
 
 // CaddyModule returns the Caddy module information.
@@ -132,6 +145,7 @@ func (m *VarsMatcher) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	if *m == nil {
 		*m = make(map[string][]string)
 	}
+	// iterate to merge multiple matchers into one
 	for d.Next() {
 		var field string
 		if !d.Args(&field) {
@@ -152,21 +166,27 @@ func (m *VarsMatcher) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 // Match matches a request based on variables in the context,
 // or placeholders if the key is not a variable.
 func (m VarsMatcher) Match(r *http.Request) bool {
+	match, _ := m.MatchWithError(r)
+	return match
+}
+
+// MatchWithError returns true if r matches m.
+func (m VarsMatcher) MatchWithError(r *http.Request) (bool, error) {
 	if len(m) == 0 {
-		return true
+		return true, nil
 	}
 
-	vars := r.Context().Value(VarsCtxKey).(map[string]interface{})
+	vars := r.Context().Value(VarsCtxKey).(map[string]any)
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 	for key, vals := range m {
-		// look up the comparison value we will check against with this key
-		matcherVarNameExpanded := repl.ReplaceAll(key, "")
-		varValue, ok := vars[matcherVarNameExpanded]
-		if !ok {
-			// as a special case, if it's not an HTTP variable,
-			// see if it's a placeholder name
-			varValue, _ = repl.Get(matcherVarNameExpanded)
+		var varValue any
+		if strings.HasPrefix(key, "{") &&
+			strings.HasSuffix(key, "}") &&
+			strings.Count(key, "{") == 1 {
+			varValue, _ = repl.Get(strings.Trim(key, "{}"))
+		} else {
+			varValue = vars[key]
 		}
 
 		// see if any of the values given in the matcher match the actual value
@@ -180,15 +200,39 @@ func (m VarsMatcher) Match(r *http.Request) bool {
 				varStr = vv.String()
 			case error:
 				varStr = vv.Error()
+			case nil:
+				varStr = ""
 			default:
 				varStr = fmt.Sprintf("%v", vv)
 			}
 			if varStr == matcherValExpanded {
-				return true
+				return true, nil
 			}
 		}
 	}
-	return false
+	return false, nil
+}
+
+// CELLibrary produces options that expose this matcher for use in CEL
+// expression matchers.
+//
+// Example:
+//
+//	expression vars({'{magic_number}': ['3', '5']})
+//	expression vars({'{foo}': 'single_value'})
+func (VarsMatcher) CELLibrary(_ caddy.Context) (cel.Library, error) {
+	return CELMatcherImpl(
+		"vars",
+		"vars_matcher_request_map",
+		[]*cel.Type{CELTypeJSON},
+		func(data ref.Val) (RequestMatcherWithError, error) {
+			mapStrListStr, err := CELValueToMapStrList(data)
+			if err != nil {
+				return nil, err
+			}
+			return VarsMatcher(mapStrListStr), nil
+		},
+	)
 }
 
 // MatchVarsRE matches the value of the context variables by a given regular expression.
@@ -213,6 +257,7 @@ func (m *MatchVarsRE) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	if *m == nil {
 		*m = make(map[string]*MatchRegexp)
 	}
+	// iterate to merge multiple matchers into one
 	for d.Next() {
 		var first, second, third string
 		if !d.Args(&first, &second) {
@@ -227,6 +272,11 @@ func (m *MatchVarsRE) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		} else {
 			field = first
 			val = second
+		}
+
+		// Default to the named matcher's name, if no regexp name is provided
+		if name == "" {
+			name = d.GetContextString(caddyfile.MatcherNameCtxKey)
 		}
 
 		(*m)[field] = &MatchRegexp{Pattern: val, Name: name}
@@ -250,31 +300,107 @@ func (m MatchVarsRE) Provision(ctx caddy.Context) error {
 
 // Match returns true if r matches m.
 func (m MatchVarsRE) Match(r *http.Request) bool {
-	vars := r.Context().Value(VarsCtxKey).(map[string]interface{})
+	match, _ := m.MatchWithError(r)
+	return match
+}
+
+// MatchWithError returns true if r matches m.
+func (m MatchVarsRE) MatchWithError(r *http.Request) (bool, error) {
+	vars := r.Context().Value(VarsCtxKey).(map[string]any)
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	for k, rm := range m {
+	for key, val := range m {
+		var varValue any
+		if strings.HasPrefix(key, "{") &&
+			strings.HasSuffix(key, "}") &&
+			strings.Count(key, "{") == 1 {
+			varValue, _ = repl.Get(strings.Trim(key, "{}"))
+		} else {
+			varValue = vars[key]
+		}
+
 		var varStr string
-		switch vv := vars[k].(type) {
+		switch vv := varValue.(type) {
 		case string:
 			varStr = vv
 		case fmt.Stringer:
 			varStr = vv.String()
 		case error:
 			varStr = vv.Error()
+		case nil:
+			varStr = ""
 		default:
 			varStr = fmt.Sprintf("%v", vv)
 		}
-		valExpanded := repl.ReplaceAll(varStr, "")
-		if match := rm.Match(valExpanded, repl); match {
-			return match
-		}
 
-		replacedVal := repl.ReplaceAll(k, "")
-		if match := rm.Match(replacedVal, repl); match {
-			return match
+		valExpanded := repl.ReplaceAll(varStr, "")
+		if match := val.Match(valExpanded, repl); match {
+			return match, nil
 		}
 	}
-	return false
+	return false, nil
+}
+
+// CELLibrary produces options that expose this matcher for use in CEL
+// expression matchers.
+//
+// Example:
+//
+//	expression vars_regexp('foo', '{magic_number}', '[0-9]+')
+//	expression vars_regexp('{magic_number}', '[0-9]+')
+func (MatchVarsRE) CELLibrary(ctx caddy.Context) (cel.Library, error) {
+	unnamedPattern, err := CELMatcherImpl(
+		"vars_regexp",
+		"vars_regexp_request_string_string",
+		[]*cel.Type{cel.StringType, cel.StringType},
+		func(data ref.Val) (RequestMatcherWithError, error) {
+			refStringList := reflect.TypeOf([]string{})
+			params, err := data.ConvertToNative(refStringList)
+			if err != nil {
+				return nil, err
+			}
+			strParams := params.([]string)
+			matcher := MatchVarsRE{}
+			matcher[strParams[0]] = &MatchRegexp{
+				Pattern: strParams[1],
+				Name:    ctx.Value(MatcherNameCtxKey).(string),
+			}
+			err = matcher.Provision(ctx)
+			return matcher, err
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	namedPattern, err := CELMatcherImpl(
+		"vars_regexp",
+		"vars_regexp_request_string_string_string",
+		[]*cel.Type{cel.StringType, cel.StringType, cel.StringType},
+		func(data ref.Val) (RequestMatcherWithError, error) {
+			refStringList := reflect.TypeOf([]string{})
+			params, err := data.ConvertToNative(refStringList)
+			if err != nil {
+				return nil, err
+			}
+			strParams := params.([]string)
+			name := strParams[0]
+			if name == "" {
+				name = ctx.Value(MatcherNameCtxKey).(string)
+			}
+			matcher := MatchVarsRE{}
+			matcher[strParams[1]] = &MatchRegexp{
+				Pattern: strParams[2],
+				Name:    name,
+			}
+			err = matcher.Provision(ctx)
+			return matcher, err
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	envOpts := append(unnamedPattern.CompileOptions(), namedPattern.CompileOptions()...)
+	prgOpts := append(unnamedPattern.ProgramOptions(), namedPattern.ProgramOptions()...)
+	return NewMatcherCELLibrary(envOpts, prgOpts), nil
 }
 
 // Validate validates m's regular expressions.
@@ -290,8 +416,8 @@ func (m MatchVarsRE) Validate() error {
 
 // GetVar gets a value out of the context's variable table by key.
 // If the key does not exist, the return value will be nil.
-func GetVar(ctx context.Context, key string) interface{} {
-	varMap, ok := ctx.Value(VarsCtxKey).(map[string]interface{})
+func GetVar(ctx context.Context, key string) any {
+	varMap, ok := ctx.Value(VarsCtxKey).(map[string]any)
 	if !ok {
 		return nil
 	}
@@ -301,18 +427,30 @@ func GetVar(ctx context.Context, key string) interface{} {
 // SetVar sets a value in the context's variable table with
 // the given key. It overwrites any previous value with the
 // same key.
-func SetVar(ctx context.Context, key string, value interface{}) {
-	varMap, ok := ctx.Value(VarsCtxKey).(map[string]interface{})
+//
+// If the value is nil (note: non-nil interface with nil
+// underlying value does not count) and the key exists in
+// the table, the key+value will be deleted from the table.
+func SetVar(ctx context.Context, key string, value any) {
+	varMap, ok := ctx.Value(VarsCtxKey).(map[string]any)
 	if !ok {
 		return
+	}
+	if value == nil {
+		if _, ok := varMap[key]; ok {
+			delete(varMap, key)
+			return
+		}
 	}
 	varMap[key] = value
 }
 
 // Interface guards
 var (
-	_ MiddlewareHandler     = (*VarsMiddleware)(nil)
-	_ caddyfile.Unmarshaler = (*VarsMiddleware)(nil)
-	_ RequestMatcher        = (*VarsMatcher)(nil)
-	_ caddyfile.Unmarshaler = (*VarsMatcher)(nil)
+	_ MiddlewareHandler       = (*VarsMiddleware)(nil)
+	_ caddyfile.Unmarshaler   = (*VarsMiddleware)(nil)
+	_ RequestMatcherWithError = (*VarsMatcher)(nil)
+	_ caddyfile.Unmarshaler   = (*VarsMatcher)(nil)
+	_ RequestMatcherWithError = (*MatchVarsRE)(nil)
+	_ caddyfile.Unmarshaler   = (*MatchVarsRE)(nil)
 )

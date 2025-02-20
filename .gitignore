@@ -3,6 +3,7 @@ _gitignore/
 Caddyfile
 Caddyfile.*
 !caddyfile/
+!caddyfile.go
 
 # artifacts from pprof tooling
 *.prof
@@ -11,6 +12,8 @@ Caddyfile.*
 # build artifacts and helpers
 cmd/caddy/caddy
 cmd/caddy/caddy.exe
+cmd/caddy/tmp/*.exe
+cmd/caddy/.env
 
 # mac specific
 .DS_Store

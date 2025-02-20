@@ -1,6 +1,7 @@
 package httpcaddyfile
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -24,11 +25,12 @@ func TestLogDirectiveSyntax(t *testing.T) {
 		{
 			input: `:8080 {
 				log {
+					core mock
 					output file foo.log
 				}
 			}
 			`,
-			output:      `{"logging":{"logs":{"default":{"exclude":["http.log.access.log0"]},"log0":{"writer":{"filename":"foo.log","output":"file"},"include":["http.log.access.log0"]}}},"apps":{"http":{"servers":{"srv0":{"listen":[":8080"],"logs":{"default_logger_name":"log0"}}}}}}`,
+			output:      `{"logging":{"logs":{"default":{"exclude":["http.log.access.log0"]},"log0":{"writer":{"filename":"foo.log","output":"file"},"core":{"module":"mock"},"include":["http.log.access.log0"]}}},"apps":{"http":{"servers":{"srv0":{"listen":[":8080"],"logs":{"default_logger_name":"log0"}}}}}}`,
 			expectError: false,
 		},
 		{
@@ -51,12 +53,28 @@ func TestLogDirectiveSyntax(t *testing.T) {
 		},
 		{
 			input: `:8080 {
-				log invalid {
+				log name-override {
+					core mock
 					output file foo.log
 				}
 			}
 			`,
-			expectError: true,
+			output:      `{"logging":{"logs":{"default":{"exclude":["http.log.access.name-override"]},"name-override":{"writer":{"filename":"foo.log","output":"file"},"core":{"module":"mock"},"include":["http.log.access.name-override"]}}},"apps":{"http":{"servers":{"srv0":{"listen":[":8080"],"logs":{"default_logger_name":"name-override"}}}}}}`,
+			expectError: false,
+		},
+		{
+			input: `:8080 {
+				log {
+					sampling {
+						interval 2
+						first 3
+						thereafter 4
+					}
+				}
+			}
+			`,
+			output:      `{"logging":{"logs":{"default":{"exclude":["http.log.access.log0"]},"log0":{"sampling":{"interval":2,"first":3,"thereafter":4},"include":["http.log.access.log0"]}}},"apps":{"http":{"servers":{"srv0":{"listen":[":8080"],"logs":{"default_logger_name":"log0"}}}}}}`,
+			expectError: false,
 		},
 	} {
 
@@ -209,6 +227,142 @@ func TestRedirDirectiveSyntax(t *testing.T) {
 
 		if err != nil != tc.expectError {
 			t.Errorf("Test %d error expectation failed Expected: %v, got %s", i, tc.expectError, err)
+			continue
+		}
+	}
+}
+
+func TestImportErrorLine(t *testing.T) {
+	for i, tc := range []struct {
+		input     string
+		errorFunc func(err error) bool
+	}{
+		{
+			input: `(t1) {
+					abort {args[:]}
+				}
+				:8080 {
+					import t1
+					import t1 true
+				}`,
+			errorFunc: func(err error) bool {
+				return err != nil && strings.Contains(err.Error(), "Caddyfile:6 (import t1)")
+			},
+		},
+		{
+			input: `(t1) {
+					abort {args[:]}
+				}
+				:8080 {
+					import t1 true
+				}`,
+			errorFunc: func(err error) bool {
+				return err != nil && strings.Contains(err.Error(), "Caddyfile:5 (import t1)")
+			},
+		},
+		{
+			input: `
+				import testdata/import_variadic_snippet.txt
+				:8080 {
+					import t1 true
+				}`,
+			errorFunc: func(err error) bool {
+				return err == nil
+			},
+		},
+		{
+			input: `
+				import testdata/import_variadic_with_import.txt
+				:8080 {
+					import t1 true
+					import t2 true
+				}`,
+			errorFunc: func(err error) bool {
+				return err == nil
+			},
+		},
+	} {
+		adapter := caddyfile.Adapter{
+			ServerType: ServerType{},
+		}
+
+		_, _, err := adapter.Adapt([]byte(tc.input), nil)
+
+		if !tc.errorFunc(err) {
+			t.Errorf("Test %d error expectation failed, got %s", i, err)
+			continue
+		}
+	}
+}
+
+func TestNestedImport(t *testing.T) {
+	for i, tc := range []struct {
+		input     string
+		errorFunc func(err error) bool
+	}{
+		{
+			input: `(t1) {
+						respond {args[0]} {args[1]}
+					}
+					
+					(t2) {
+						import t1 {args[0]} 202
+					}
+					
+					:8080 {
+						handle {
+							import t2 "foobar"
+						}
+					}`,
+			errorFunc: func(err error) bool {
+				return err == nil
+			},
+		},
+		{
+			input: `(t1) {
+						respond {args[:]}
+					}
+					
+					(t2) {
+						import t1 {args[0]} {args[1]}
+					}
+					
+					:8080 {
+						handle {
+							import t2 "foobar" 202
+						}
+					}`,
+			errorFunc: func(err error) bool {
+				return err == nil
+			},
+		},
+		{
+			input: `(t1) {
+						respond {args[0]} {args[1]}
+					}
+					
+					(t2) {
+						import t1 {args[:]}
+					}
+					
+					:8080 {
+						handle {
+							import t2 "foobar" 202
+						}
+					}`,
+			errorFunc: func(err error) bool {
+				return err == nil
+			},
+		},
+	} {
+		adapter := caddyfile.Adapter{
+			ServerType: ServerType{},
+		}
+
+		_, _, err := adapter.Adapt([]byte(tc.input), nil)
+
+		if !tc.errorFunc(err) {
+			t.Errorf("Test %d error expectation failed, got %s", i, err)
 			continue
 		}
 	}

@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"net/http"
 
+	"go.uber.org/zap"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"go.uber.org/zap"
 )
 
 func init() {
@@ -42,7 +43,7 @@ func (Tracing) CaddyModule() caddy.ModuleInfo {
 
 // Provision implements caddy.Provisioner.
 func (ot *Tracing) Provision(ctx caddy.Context) error {
-	ot.logger = ctx.Logger(ot)
+	ot.logger = ctx.Logger()
 
 	var err error
 	ot.otel, err = newOpenTelemetryWrapper(ctx, ot.SpanName)
@@ -66,10 +67,9 @@ func (ot *Tracing) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens. Syntax:
 //
-//     tracing {
-//         [span <span_name>]
-//     }
-//
+//	tracing {
+//	    [span <span_name>]
+//	}
 func (ot *Tracing) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	setParameter := func(d *caddyfile.Dispenser, val *string) error {
 		if d.NextArg() {
@@ -88,20 +88,18 @@ func (ot *Tracing) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		"span": &ot.SpanName,
 	}
 
-	for d.Next() {
-		args := d.RemainingArgs()
-		if len(args) > 0 {
-			return d.ArgErr()
-		}
+	d.Next() // consume directive name
+	if d.NextArg() {
+		return d.ArgErr()
+	}
 
-		for d.NextBlock(0) {
-			if dst, ok := paramsMap[d.Val()]; ok {
-				if err := setParameter(d, dst); err != nil {
-					return err
-				}
-			} else {
-				return d.ArgErr()
+	for d.NextBlock(0) {
+		if dst, ok := paramsMap[d.Val()]; ok {
+			if err := setParameter(d, dst); err != nil {
+				return err
 			}
+		} else {
+			return d.ArgErr()
 		}
 	}
 	return nil

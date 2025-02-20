@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
@@ -35,81 +36,86 @@ func init() {
 
 // UnmarshalCaddyfile deserializes Caddyfile tokens into h.
 //
-//     transport fastcgi {
-//         root <path>
-//         split <at>
-//         env <key> <value>
-//         resolve_root_symlink
-//         dial_timeout <duration>
-//         read_timeout <duration>
-//         write_timeout <duration>
-//     }
-//
+//	transport fastcgi {
+//	    root <path>
+//	    split <at>
+//	    env <key> <value>
+//	    resolve_root_symlink
+//	    dial_timeout <duration>
+//	    read_timeout <duration>
+//	    write_timeout <duration>
+//	    capture_stderr
+//	}
 func (t *Transport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		for d.NextBlock(0) {
-			switch d.Val() {
-			case "root":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				t.Root = d.Val()
-
-			case "split":
-				t.SplitPath = d.RemainingArgs()
-				if len(t.SplitPath) == 0 {
-					return d.ArgErr()
-				}
-
-			case "env":
-				args := d.RemainingArgs()
-				if len(args) != 2 {
-					return d.ArgErr()
-				}
-				if t.EnvVars == nil {
-					t.EnvVars = make(map[string]string)
-				}
-				t.EnvVars[args[0]] = args[1]
-
-			case "resolve_root_symlink":
-				if d.NextArg() {
-					return d.ArgErr()
-				}
-				t.ResolveRootSymlink = true
-
-			case "dial_timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("bad timeout value %s: %v", d.Val(), err)
-				}
-				t.DialTimeout = caddy.Duration(dur)
-
-			case "read_timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("bad timeout value %s: %v", d.Val(), err)
-				}
-				t.ReadTimeout = caddy.Duration(dur)
-
-			case "write_timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("bad timeout value %s: %v", d.Val(), err)
-				}
-				t.WriteTimeout = caddy.Duration(dur)
-
-			default:
-				return d.Errf("unrecognized subdirective %s", d.Val())
+	d.Next() // consume transport name
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "root":
+			if !d.NextArg() {
+				return d.ArgErr()
 			}
+			t.Root = d.Val()
+
+		case "split":
+			t.SplitPath = d.RemainingArgs()
+			if len(t.SplitPath) == 0 {
+				return d.ArgErr()
+			}
+
+		case "env":
+			args := d.RemainingArgs()
+			if len(args) != 2 {
+				return d.ArgErr()
+			}
+			if t.EnvVars == nil {
+				t.EnvVars = make(map[string]string)
+			}
+			t.EnvVars[args[0]] = args[1]
+
+		case "resolve_root_symlink":
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			t.ResolveRootSymlink = true
+
+		case "dial_timeout":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad timeout value %s: %v", d.Val(), err)
+			}
+			t.DialTimeout = caddy.Duration(dur)
+
+		case "read_timeout":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad timeout value %s: %v", d.Val(), err)
+			}
+			t.ReadTimeout = caddy.Duration(dur)
+
+		case "write_timeout":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad timeout value %s: %v", d.Val(), err)
+			}
+			t.WriteTimeout = caddy.Duration(dur)
+
+		case "capture_stderr":
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			t.CaptureStderr = true
+
+		default:
+			return d.Errf("unrecognized subdirective %s", d.Val())
 		}
 	}
 	return nil
@@ -120,31 +126,34 @@ func (t *Transport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 // Unmarshaler is invoked by this function) but the resulting proxy is specially
 // configured for most™️ PHP apps over FastCGI. A line such as this:
 //
-//     php_fastcgi localhost:7777
+//	php_fastcgi localhost:7777
 //
 // is equivalent to a route consisting of:
 //
-//     # Add trailing slash for directory requests
-//     @canonicalPath {
-//         file {path}/index.php
-//         not path */
-//     }
-//     redir @canonicalPath {path}/ 308
+//	# Add trailing slash for directory requests
+//	# This redirection is automatically disabled if "{http.request.uri.path}/index.php"
+//	# doesn't appear in the try_files list
+//	@canonicalPath {
+//	    file {path}/index.php
+//	    not path */
+//	}
+//	redir @canonicalPath {path}/ 308
 //
-//     # If the requested file does not exist, try index files
-//     @indexFiles file {
-//         try_files {path} {path}/index.php index.php
-//         split_path .php
-//     }
-//     rewrite @indexFiles {http.matchers.file.relative}
+//	# If the requested file does not exist, try index files and assume index.php always exists
+//	@indexFiles file {
+//	    try_files {path} {path}/index.php index.php
+//	    try_policy first_exist_fallback
+//	    split_path .php
+//	}
+//	rewrite @indexFiles {http.matchers.file.relative}
 //
-//     # Proxy PHP files to the FastCGI responder
-//     @phpFiles path *.php
-//     reverse_proxy @phpFiles localhost:7777 {
-//         transport fastcgi {
-//             split .php
-//         }
-//     }
+//	# Proxy PHP files to the FastCGI responder
+//	@phpFiles path *.php
+//	reverse_proxy @phpFiles localhost:7777 {
+//	    transport fastcgi {
+//	        split .php
+//	    }
+//	}
 //
 // Thus, this directive produces multiple handlers, each with a different
 // matcher because multiple consecutive handlers are necessary to support
@@ -154,7 +163,7 @@ func (t *Transport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 //
 // If a matcher is specified by the user, for example:
 //
-//     php_fastcgi /subpath localhost:7777
+//	php_fastcgi /subpath localhost:7777
 //
 // then the resulting handlers are wrapped in a subroute that uses the
 // user's matcher as a prerequisite to enter the subroute. In other
@@ -174,7 +183,7 @@ func parsePHPFastCGI(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 	indexFile := "index.php"
 
 	// set up for explicitly overriding try_files
-	tryFiles := []string{}
+	var tryFiles []string
 
 	// if the user specified a matcher token, use that
 	// matcher in a route that wraps both of our routes;
@@ -211,25 +220,18 @@ func parsePHPFastCGI(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 					return nil, dispenser.ArgErr()
 				}
 				fcgiTransport.Root = dispenser.Val()
-				dispenser.Delete()
-				dispenser.Delete()
+				dispenser.DeleteN(2)
 
 			case "split":
 				extensions = dispenser.RemainingArgs()
-				dispenser.Delete()
-				for range extensions {
-					dispenser.Delete()
-				}
+				dispenser.DeleteN(len(extensions) + 1)
 				if len(extensions) == 0 {
 					return nil, dispenser.ArgErr()
 				}
 
 			case "env":
 				args := dispenser.RemainingArgs()
-				dispenser.Delete()
-				for range args {
-					dispenser.Delete()
-				}
+				dispenser.DeleteN(len(args) + 1)
 				if len(args) != 2 {
 					return nil, dispenser.ArgErr()
 				}
@@ -240,10 +242,7 @@ func parsePHPFastCGI(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 
 			case "index":
 				args := dispenser.RemainingArgs()
-				dispenser.Delete()
-				for range args {
-					dispenser.Delete()
-				}
+				dispenser.DeleteN(len(args) + 1)
 				if len(args) != 1 {
 					return nil, dispenser.ArgErr()
 				}
@@ -251,10 +250,7 @@ func parsePHPFastCGI(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 
 			case "try_files":
 				args := dispenser.RemainingArgs()
-				dispenser.Delete()
-				for range args {
-					dispenser.Delete()
-				}
+				dispenser.DeleteN(len(args) + 1)
 				if len(args) < 1 {
 					return nil, dispenser.ArgErr()
 				}
@@ -262,10 +258,7 @@ func parsePHPFastCGI(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 
 			case "resolve_root_symlink":
 				args := dispenser.RemainingArgs()
-				dispenser.Delete()
-				for range args {
-					dispenser.Delete()
-				}
+				dispenser.DeleteN(len(args) + 1)
 				fcgiTransport.ResolveRootSymlink = true
 
 			case "dial_timeout":
@@ -277,8 +270,7 @@ func parsePHPFastCGI(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 					return nil, dispenser.Errf("bad timeout value %s: %v", dispenser.Val(), err)
 				}
 				fcgiTransport.DialTimeout = caddy.Duration(dur)
-				dispenser.Delete()
-				dispenser.Delete()
+				dispenser.DeleteN(2)
 
 			case "read_timeout":
 				if !dispenser.NextArg() {
@@ -289,8 +281,7 @@ func parsePHPFastCGI(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 					return nil, dispenser.Errf("bad timeout value %s: %v", dispenser.Val(), err)
 				}
 				fcgiTransport.ReadTimeout = caddy.Duration(dur)
-				dispenser.Delete()
-				dispenser.Delete()
+				dispenser.DeleteN(2)
 
 			case "write_timeout":
 				if !dispenser.NextArg() {
@@ -301,8 +292,12 @@ func parsePHPFastCGI(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 					return nil, dispenser.Errf("bad timeout value %s: %v", dispenser.Val(), err)
 				}
 				fcgiTransport.WriteTimeout = caddy.Duration(dur)
-				dispenser.Delete()
-				dispenser.Delete()
+				dispenser.DeleteN(2)
+
+			case "capture_stderr":
+				args := dispenser.RemainingArgs()
+				dispenser.DeleteN(len(args) + 1)
+				fcgiTransport.CaptureStderr = true
 			}
 		}
 	}
@@ -319,37 +314,60 @@ func parsePHPFastCGI(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 
 	// if the index is turned off, we skip the redirect and try_files
 	if indexFile != "off" {
-		// route to redirect to canonical path if index PHP file
-		redirMatcherSet := caddy.ModuleMap{
-			"file": h.JSON(fileserver.MatchFile{
-				TryFiles: []string{"{http.request.uri.path}/" + indexFile},
-			}),
-			"not": h.JSON(caddyhttp.MatchNot{
-				MatcherSetsRaw: []caddy.ModuleMap{
-					{
-						"path": h.JSON(caddyhttp.MatchPath{"*/"}),
-					},
-				},
-			}),
-		}
-		redirHandler := caddyhttp.StaticResponse{
-			StatusCode: caddyhttp.WeakString(strconv.Itoa(http.StatusPermanentRedirect)),
-			Headers:    http.Header{"Location": []string{"{http.request.uri.path}/"}},
-		}
-		redirRoute := caddyhttp.Route{
-			MatcherSetsRaw: []caddy.ModuleMap{redirMatcherSet},
-			HandlersRaw:    []json.RawMessage{caddyconfig.JSONModuleObject(redirHandler, "handler", "static_response", nil)},
-		}
+		dirRedir := false
+		dirIndex := "{http.request.uri.path}/" + indexFile
+		tryPolicy := "first_exist_fallback"
 
 		// if tryFiles wasn't overridden, use a reasonable default
 		if len(tryFiles) == 0 {
-			tryFiles = []string{"{http.request.uri.path}", "{http.request.uri.path}/" + indexFile, indexFile}
+			tryFiles = []string{"{http.request.uri.path}", dirIndex, indexFile}
+			dirRedir = true
+		} else {
+			if !strings.HasSuffix(tryFiles[len(tryFiles)-1], ".php") {
+				// use first_exist strategy if the last file is not a PHP file
+				tryPolicy = ""
+			}
+
+			for _, tf := range tryFiles {
+				if tf == dirIndex {
+					dirRedir = true
+
+					break
+				}
+			}
+		}
+
+		if dirRedir {
+			// route to redirect to canonical path if index PHP file
+			redirMatcherSet := caddy.ModuleMap{
+				"file": h.JSON(fileserver.MatchFile{
+					TryFiles: []string{dirIndex},
+				}),
+				"not": h.JSON(caddyhttp.MatchNot{
+					MatcherSetsRaw: []caddy.ModuleMap{
+						{
+							"path": h.JSON(caddyhttp.MatchPath{"*/"}),
+						},
+					},
+				}),
+			}
+			redirHandler := caddyhttp.StaticResponse{
+				StatusCode: caddyhttp.WeakString(strconv.Itoa(http.StatusPermanentRedirect)),
+				Headers:    http.Header{"Location": []string{"{http.request.orig_uri.path}/{http.request.orig_uri.prefixed_query}"}},
+			}
+			redirRoute := caddyhttp.Route{
+				MatcherSetsRaw: []caddy.ModuleMap{redirMatcherSet},
+				HandlersRaw:    []json.RawMessage{caddyconfig.JSONModuleObject(redirHandler, "handler", "static_response", nil)},
+			}
+
+			routes = append(routes, redirRoute)
 		}
 
 		// route to rewrite to PHP index file
 		rewriteMatcherSet := caddy.ModuleMap{
 			"file": h.JSON(fileserver.MatchFile{
 				TryFiles:  tryFiles,
+				TryPolicy: tryPolicy,
 				SplitPath: extensions,
 			}),
 		}
@@ -361,7 +379,7 @@ func parsePHPFastCGI(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 			HandlersRaw:    []json.RawMessage{caddyconfig.JSONModuleObject(rewriteHandler, "handler", "rewrite", nil)},
 		}
 
-		routes = append(routes, redirRoute, rewriteRoute)
+		routes = append(routes, rewriteRoute)
 	}
 
 	// route to actually reverse proxy requests to PHP files;
@@ -381,6 +399,7 @@ func parsePHPFastCGI(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 
 	// the rest of the config is specified by the user
 	// using the reverse_proxy directive syntax
+	dispenser.Next() // consume the directive name
 	err = rpHandler.UnmarshalCaddyfile(dispenser)
 	if err != nil {
 		return nil, err

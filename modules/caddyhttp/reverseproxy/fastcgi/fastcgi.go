@@ -15,7 +15,6 @@
 package fastcgi
 
 import (
-	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -25,14 +24,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
-	"github.com/caddyserver/caddy/v2/modules/caddytls"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
+	"github.com/caddyserver/caddy/v2/modules/caddytls"
 )
+
+var noopLogger = zap.NewNop()
 
 func init() {
 	caddy.RegisterModule(Transport{})
@@ -74,6 +75,11 @@ type Transport struct {
 	// The duration used to set a deadline when sending to the FastCGI server.
 	WriteTimeout caddy.Duration `json:"write_timeout,omitempty"`
 
+	// Capture and log any messages sent by the upstream on stderr. Logs at WARN
+	// level by default. If the response has a 4xx or 5xx status ERROR level will
+	// be used instead.
+	CaptureStderr bool `json:"capture_stderr,omitempty"`
+
 	serverSoftware string
 	logger         *zap.Logger
 }
@@ -88,16 +94,14 @@ func (Transport) CaddyModule() caddy.ModuleInfo {
 
 // Provision sets up t.
 func (t *Transport) Provision(ctx caddy.Context) error {
-	t.logger = ctx.Logger(t)
+	t.logger = ctx.Logger()
 
 	if t.Root == "" {
 		t.Root = "{http.vars.root}"
 	}
 
-	t.serverSoftware = "Caddy"
-	if mod := caddy.GoModule(); mod.Version != "" {
-		t.serverSoftware += "/" + mod.Version
-	}
+	version, _ := caddy.Version()
+	t.serverSoftware = "Caddy/" + version
 
 	// Set a relatively short default dial timeout.
 	// This is helpful to make load-balancer retries more speedy.
@@ -110,6 +114,8 @@ func (t *Transport) Provision(ctx caddy.Context) error {
 
 // RoundTrip implements http.RoundTripper.
 func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
+	server := r.Context().Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server)
+
 	// Disallow null bytes in the request path, because
 	// PHP upstreams may do bad things, like execute a
 	// non-PHP file as PHP code. See #4574
@@ -122,13 +128,7 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("building environment: %v", err)
 	}
 
-	// TODO: doesn't dialer have a Timeout field?
 	ctx := r.Context()
-	if t.DialTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(t.DialTimeout))
-		defer cancel()
-	}
 
 	// extract dial information from request (should have been embedded by the reverse proxy)
 	network, address := "tcp", r.URL.Host
@@ -137,24 +137,51 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		address = dialInfo.Address
 	}
 
-	t.logger.Debug("roundtrip",
-		zap.Object("request", caddyhttp.LoggableHTTPRequest{Request: r}),
-		zap.String("dial", address),
-		zap.Object("env", env),
-	)
+	logCreds := server.Logs != nil && server.Logs.ShouldLogCredentials
+	loggableReq := caddyhttp.LoggableHTTPRequest{
+		Request:              r,
+		ShouldLogCredentials: logCreds,
+	}
+	loggableEnv := loggableEnv{vars: env, logCredentials: logCreds}
 
-	fcgiBackend, err := DialContext(ctx, network, address)
+	logger := t.logger.With(
+		zap.Object("request", loggableReq),
+		zap.Object("env", loggableEnv),
+	)
+	if c := t.logger.Check(zapcore.DebugLevel, "roundtrip"); c != nil {
+		c.Write(
+			zap.String("dial", address),
+			zap.Object("env", loggableEnv),
+			zap.Object("request", loggableReq),
+		)
+	}
+
+	// connect to the backend
+	dialer := net.Dialer{Timeout: time.Duration(t.DialTimeout)}
+	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
-		// TODO: wrap in a special error type if the dial failed, so retries can happen if enabled
 		return nil, fmt.Errorf("dialing backend: %v", err)
 	}
-	// fcgiBackend gets closed when response body is closed (see clientCloser)
+	defer func() {
+		// conn will be closed with the response body unless there's an error
+		if err != nil {
+			conn.Close()
+		}
+	}()
+
+	// create the client that will facilitate the protocol
+	client := client{
+		rwc:    conn,
+		reqID:  1,
+		logger: logger,
+		stderr: t.CaptureStderr,
+	}
 
 	// read/write timeouts
-	if err := fcgiBackend.SetReadTimeout(time.Duration(t.ReadTimeout)); err != nil {
+	if err = client.SetReadTimeout(time.Duration(t.ReadTimeout)); err != nil {
 		return nil, fmt.Errorf("setting read timeout: %v", err)
 	}
-	if err := fcgiBackend.SetWriteTimeout(time.Duration(t.WriteTimeout)); err != nil {
+	if err = client.SetWriteTimeout(time.Duration(t.WriteTimeout)); err != nil {
 		return nil, fmt.Errorf("setting write timeout: %v", err)
 	}
 
@@ -166,16 +193,19 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 	var resp *http.Response
 	switch r.Method {
 	case http.MethodHead:
-		resp, err = fcgiBackend.Head(env)
+		resp, err = client.Head(env)
 	case http.MethodGet:
-		resp, err = fcgiBackend.Get(env, r.Body, contentLength)
+		resp, err = client.Get(env, r.Body, contentLength)
 	case http.MethodOptions:
-		resp, err = fcgiBackend.Options(env)
+		resp, err = client.Options(env)
 	default:
-		resp, err = fcgiBackend.Post(env, r.Method, r.Header.Get("Content-Type"), r.Body, contentLength)
+		resp, err = client.Post(env, r.Method, r.Header.Get("Content-Type"), r.Body, contentLength)
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	return resp, err
+	return resp, nil
 }
 
 // buildEnv returns a set of CGI environment variables for the request.
@@ -198,7 +228,7 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 	ip = strings.Replace(ip, "]", "", 1)
 
 	// make sure file root is absolute
-	root, err := filepath.Abs(repl.ReplaceAll(t.Root, "."))
+	root, err := caddy.FastAbs(repl.ReplaceAll(t.Root, "."))
 	if err != nil {
 		return nil, err
 	}
@@ -228,9 +258,7 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 	// if we didn't get a split result here.
 	// See https://github.com/caddyserver/caddy/issues/3718
 	if pathInfo == "" {
-		if remainder, ok := repl.GetString("http.matchers.file.remainder"); ok {
-			pathInfo = remainder
-		}
+		pathInfo, _ = repl.GetString("http.matchers.file.remainder")
 	}
 
 	// SCRIPT_FILENAME is the absolute path of SCRIPT_NAME
@@ -260,10 +288,7 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 		reqHost = r.Host
 	}
 
-	authUser := ""
-	if val, ok := repl.Get("http.auth.user.id"); ok {
-		authUser = val.(string)
-	}
+	authUser, _ := repl.GetString("http.auth.user.id")
 
 	// Some variables are unused but cleared explicitly to prevent
 	// the parent environment from interfering.
@@ -366,11 +391,22 @@ func (t Transport) splitPos(path string) int {
 	return -1
 }
 
-// envVars is a simple type to allow for speeding up zap log encoding.
 type envVars map[string]string
 
-func (env envVars) MarshalLogObject(enc zapcore.ObjectEncoder) error {
-	for k, v := range env {
+// loggableEnv is a simple type to allow for speeding up zap log encoding.
+type loggableEnv struct {
+	vars           envVars
+	logCredentials bool
+}
+
+func (env loggableEnv) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	for k, v := range env.vars {
+		if !env.logCredentials {
+			switch strings.ToLower(k) {
+			case "http_cookie", "http_set_cookie", "http_authorization", "http_proxy_authorization":
+				v = ""
+			}
+		}
 		enc.AddString(k, v)
 	}
 	return nil
@@ -389,7 +425,7 @@ var headerNameReplacer = strings.NewReplacer(" ", "_", "-", "_")
 
 // Interface guards
 var (
-	_ zapcore.ObjectMarshaler = (*envVars)(nil)
+	_ zapcore.ObjectMarshaler = (*loggableEnv)(nil)
 
 	_ caddy.Provisioner = (*Transport)(nil)
 	_ http.RoundTripper = (*Transport)(nil)

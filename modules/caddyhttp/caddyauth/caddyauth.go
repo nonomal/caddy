@@ -18,9 +18,11 @@ import (
 	"fmt"
 	"net/http"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"go.uber.org/zap"
 )
 
 func init() {
@@ -56,13 +58,13 @@ func (Authentication) CaddyModule() caddy.ModuleInfo {
 
 // Provision sets up a.
 func (a *Authentication) Provision(ctx caddy.Context) error {
-	a.logger = ctx.Logger(a)
+	a.logger = ctx.Logger()
 	a.Providers = make(map[string]Authenticator)
 	mods, err := ctx.LoadModule(a, "ProvidersRaw")
 	if err != nil {
 		return fmt.Errorf("loading authentication providers: %v", err)
 	}
-	for modName, modIface := range mods.(map[string]interface{}) {
+	for modName, modIface := range mods.(map[string]any) {
 		a.Providers[modName] = modIface.(Authenticator)
 	}
 	return nil
@@ -75,9 +77,9 @@ func (a Authentication) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	for provName, prov := range a.Providers {
 		user, authed, err = prov.Authenticate(w, r)
 		if err != nil {
-			a.logger.Error("auth provider returned error",
-				zap.String("provider", provName),
-				zap.Error(err))
+			if c := a.logger.Check(zapcore.ErrorLevel, "auth provider returned error"); c != nil {
+				c.Write(zap.String("provider", provName), zap.Error(err))
+			}
 			continue
 		}
 		if authed {

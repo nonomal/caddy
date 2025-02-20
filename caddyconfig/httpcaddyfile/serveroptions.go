@@ -17,12 +17,14 @@ package httpcaddyfile
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
+
+	"github.com/dustin/go-humanize"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/dustin/go-humanize"
 )
 
 // serverOptions collects server config overrides parsed from Caddyfile global options
@@ -33,147 +35,228 @@ type serverOptions struct {
 	ListenerAddress string
 
 	// These will all map 1:1 to the caddyhttp.Server struct
+	Name                 string
 	ListenerWrappersRaw  []json.RawMessage
 	ReadTimeout          caddy.Duration
 	ReadHeaderTimeout    caddy.Duration
 	WriteTimeout         caddy.Duration
 	IdleTimeout          caddy.Duration
+	KeepAliveInterval    caddy.Duration
 	MaxHeaderBytes       int
-	AllowH2C             bool
-	ExperimentalHTTP3    bool
+	EnableFullDuplex     bool
+	Protocols            []string
 	StrictSNIHost        *bool
+	TrustedProxiesRaw    json.RawMessage
+	TrustedProxiesStrict int
+	ClientIPHeaders      []string
 	ShouldLogCredentials bool
+	Metrics              *caddyhttp.Metrics
+	Trace                bool // TODO: EXPERIMENTAL
 }
 
-func unmarshalCaddyfileServerOptions(d *caddyfile.Dispenser) (interface{}, error) {
+func unmarshalCaddyfileServerOptions(d *caddyfile.Dispenser) (any, error) {
+	d.Next() // consume option name
+
 	serverOpts := serverOptions{}
-	for d.Next() {
+	if d.NextArg() {
+		serverOpts.ListenerAddress = d.Val()
 		if d.NextArg() {
-			serverOpts.ListenerAddress = d.Val()
+			return nil, d.ArgErr()
+		}
+	}
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "name":
+			if serverOpts.ListenerAddress == "" {
+				return nil, d.Errf("cannot set a name for a server without a listener address")
+			}
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			serverOpts.Name = d.Val()
+
+		case "listener_wrappers":
+			for nesting := d.Nesting(); d.NextBlock(nesting); {
+				modID := "caddy.listeners." + d.Val()
+				unm, err := caddyfile.UnmarshalModule(d, modID)
+				if err != nil {
+					return nil, err
+				}
+				listenerWrapper, ok := unm.(caddy.ListenerWrapper)
+				if !ok {
+					return nil, fmt.Errorf("module %s (%T) is not a listener wrapper", modID, unm)
+				}
+				jsonListenerWrapper := caddyconfig.JSONModuleObject(
+					listenerWrapper,
+					"wrapper",
+					listenerWrapper.(caddy.Module).CaddyModule().ID.Name(),
+					nil,
+				)
+				serverOpts.ListenerWrappersRaw = append(serverOpts.ListenerWrappersRaw, jsonListenerWrapper)
+			}
+
+		case "timeouts":
+			for nesting := d.Nesting(); d.NextBlock(nesting); {
+				switch d.Val() {
+				case "read_body":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					dur, err := caddy.ParseDuration(d.Val())
+					if err != nil {
+						return nil, d.Errf("parsing read_body timeout duration: %v", err)
+					}
+					serverOpts.ReadTimeout = caddy.Duration(dur)
+
+				case "read_header":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					dur, err := caddy.ParseDuration(d.Val())
+					if err != nil {
+						return nil, d.Errf("parsing read_header timeout duration: %v", err)
+					}
+					serverOpts.ReadHeaderTimeout = caddy.Duration(dur)
+
+				case "write":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					dur, err := caddy.ParseDuration(d.Val())
+					if err != nil {
+						return nil, d.Errf("parsing write timeout duration: %v", err)
+					}
+					serverOpts.WriteTimeout = caddy.Duration(dur)
+
+				case "idle":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					dur, err := caddy.ParseDuration(d.Val())
+					if err != nil {
+						return nil, d.Errf("parsing idle timeout duration: %v", err)
+					}
+					serverOpts.IdleTimeout = caddy.Duration(dur)
+
+				default:
+					return nil, d.Errf("unrecognized timeouts option '%s'", d.Val())
+				}
+			}
+		case "keepalive_interval":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return nil, d.Errf("parsing keepalive interval duration: %v", err)
+			}
+			serverOpts.KeepAliveInterval = caddy.Duration(dur)
+
+		case "max_header_size":
+			var sizeStr string
+			if !d.AllArgs(&sizeStr) {
+				return nil, d.ArgErr()
+			}
+			size, err := humanize.ParseBytes(sizeStr)
+			if err != nil {
+				return nil, d.Errf("parsing max_header_size: %v", err)
+			}
+			serverOpts.MaxHeaderBytes = int(size)
+
+		case "enable_full_duplex":
 			if d.NextArg() {
 				return nil, d.ArgErr()
 			}
-		}
-		for nesting := d.Nesting(); d.NextBlock(nesting); {
-			switch d.Val() {
-			case "listener_wrappers":
-				for nesting := d.Nesting(); d.NextBlock(nesting); {
-					modID := "caddy.listeners." + d.Val()
-					unm, err := caddyfile.UnmarshalModule(d, modID)
-					if err != nil {
-						return nil, err
-					}
-					listenerWrapper, ok := unm.(caddy.ListenerWrapper)
-					if !ok {
-						return nil, fmt.Errorf("module %s (%T) is not a listener wrapper", modID, unm)
-					}
-					jsonListenerWrapper := caddyconfig.JSONModuleObject(
-						listenerWrapper,
-						"wrapper",
-						listenerWrapper.(caddy.Module).CaddyModule().ID.Name(),
-						nil,
-					)
-					serverOpts.ListenerWrappersRaw = append(serverOpts.ListenerWrappersRaw, jsonListenerWrapper)
-				}
+			serverOpts.EnableFullDuplex = true
 
-			case "timeouts":
-				for nesting := d.Nesting(); d.NextBlock(nesting); {
-					switch d.Val() {
-					case "read_body":
-						if !d.NextArg() {
-							return nil, d.ArgErr()
-						}
-						dur, err := caddy.ParseDuration(d.Val())
-						if err != nil {
-							return nil, d.Errf("parsing read_body timeout duration: %v", err)
-						}
-						serverOpts.ReadTimeout = caddy.Duration(dur)
-
-					case "read_header":
-						if !d.NextArg() {
-							return nil, d.ArgErr()
-						}
-						dur, err := caddy.ParseDuration(d.Val())
-						if err != nil {
-							return nil, d.Errf("parsing read_header timeout duration: %v", err)
-						}
-						serverOpts.ReadHeaderTimeout = caddy.Duration(dur)
-
-					case "write":
-						if !d.NextArg() {
-							return nil, d.ArgErr()
-						}
-						dur, err := caddy.ParseDuration(d.Val())
-						if err != nil {
-							return nil, d.Errf("parsing write timeout duration: %v", err)
-						}
-						serverOpts.WriteTimeout = caddy.Duration(dur)
-
-					case "idle":
-						if !d.NextArg() {
-							return nil, d.ArgErr()
-						}
-						dur, err := caddy.ParseDuration(d.Val())
-						if err != nil {
-							return nil, d.Errf("parsing idle timeout duration: %v", err)
-						}
-						serverOpts.IdleTimeout = caddy.Duration(dur)
-
-					default:
-						return nil, d.Errf("unrecognized timeouts option '%s'", d.Val())
-					}
-				}
-
-			case "max_header_size":
-				var sizeStr string
-				if !d.AllArgs(&sizeStr) {
-					return nil, d.ArgErr()
-				}
-				size, err := humanize.ParseBytes(sizeStr)
-				if err != nil {
-					return nil, d.Errf("parsing max_header_size: %v", err)
-				}
-				serverOpts.MaxHeaderBytes = int(size)
-
-			case "log_credentials":
-				if d.NextArg() {
-					return nil, d.ArgErr()
-				}
-				serverOpts.ShouldLogCredentials = true
-
-			case "protocol":
-				for nesting := d.Nesting(); d.NextBlock(nesting); {
-					switch d.Val() {
-					case "allow_h2c":
-						if d.NextArg() {
-							return nil, d.ArgErr()
-						}
-						serverOpts.AllowH2C = true
-
-					case "experimental_http3":
-						if d.NextArg() {
-							return nil, d.ArgErr()
-						}
-						serverOpts.ExperimentalHTTP3 = true
-
-					case "strict_sni_host":
-						if d.NextArg() && d.Val() != "insecure_off" && d.Val() != "on" {
-							return nil, d.Errf("strict_sni_host only supports 'on' or 'insecure_off', got '%s'", d.Val())
-						}
-						boolVal := true
-						if d.Val() == "insecure_off" {
-							boolVal = false
-						}
-						serverOpts.StrictSNIHost = &boolVal
-
-					default:
-						return nil, d.Errf("unrecognized protocol option '%s'", d.Val())
-					}
-				}
-
-			default:
-				return nil, d.Errf("unrecognized servers option '%s'", d.Val())
+		case "log_credentials":
+			if d.NextArg() {
+				return nil, d.ArgErr()
 			}
+			serverOpts.ShouldLogCredentials = true
+
+		case "protocols":
+			protos := d.RemainingArgs()
+			for _, proto := range protos {
+				if proto != "h1" && proto != "h2" && proto != "h2c" && proto != "h3" {
+					return nil, d.Errf("unknown protocol '%s': expected h1, h2, h2c, or h3", proto)
+				}
+				if slices.Contains(serverOpts.Protocols, proto) {
+					return nil, d.Errf("protocol %s specified more than once", proto)
+				}
+				serverOpts.Protocols = append(serverOpts.Protocols, proto)
+			}
+			if nesting := d.Nesting(); d.NextBlock(nesting) {
+				return nil, d.ArgErr()
+			}
+
+		case "strict_sni_host":
+			if d.NextArg() && d.Val() != "insecure_off" && d.Val() != "on" {
+				return nil, d.Errf("strict_sni_host only supports 'on' or 'insecure_off', got '%s'", d.Val())
+			}
+			boolVal := true
+			if d.Val() == "insecure_off" {
+				boolVal = false
+			}
+			serverOpts.StrictSNIHost = &boolVal
+
+		case "trusted_proxies":
+			if !d.NextArg() {
+				return nil, d.Err("trusted_proxies expects an IP range source module name as its first argument")
+			}
+			modID := "http.ip_sources." + d.Val()
+			unm, err := caddyfile.UnmarshalModule(d, modID)
+			if err != nil {
+				return nil, err
+			}
+			source, ok := unm.(caddyhttp.IPRangeSource)
+			if !ok {
+				return nil, fmt.Errorf("module %s (%T) is not an IP range source", modID, unm)
+			}
+			jsonSource := caddyconfig.JSONModuleObject(
+				source,
+				"source",
+				source.(caddy.Module).CaddyModule().ID.Name(),
+				nil,
+			)
+			serverOpts.TrustedProxiesRaw = jsonSource
+
+		case "trusted_proxies_strict":
+			if d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			serverOpts.TrustedProxiesStrict = 1
+
+		case "client_ip_headers":
+			headers := d.RemainingArgs()
+			for _, header := range headers {
+				if slices.Contains(serverOpts.ClientIPHeaders, header) {
+					return nil, d.Errf("client IP header %s specified more than once", header)
+				}
+				serverOpts.ClientIPHeaders = append(serverOpts.ClientIPHeaders, header)
+			}
+			if nesting := d.Nesting(); d.NextBlock(nesting) {
+				return nil, d.ArgErr()
+			}
+
+		case "metrics":
+			caddy.Log().Warn("The nested 'metrics' option inside `servers` is deprecated and will be removed in the next major version. Use the global 'metrics' option instead.")
+			serverOpts.Metrics = new(caddyhttp.Metrics)
+			for nesting := d.Nesting(); d.NextBlock(nesting); {
+				switch d.Val() {
+				case "per_host":
+					serverOpts.Metrics.PerHost = true
+				}
+			}
+
+		case "trace":
+			if d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			serverOpts.Trace = true
+
+		default:
+			return nil, d.Errf("unrecognized servers option '%s'", d.Val())
 		}
 	}
 	return serverOpts, nil
@@ -182,45 +265,40 @@ func unmarshalCaddyfileServerOptions(d *caddyfile.Dispenser) (interface{}, error
 // applyServerOptions sets the server options on the appropriate servers
 func applyServerOptions(
 	servers map[string]*caddyhttp.Server,
-	options map[string]interface{},
-	warnings *[]caddyconfig.Warning,
+	options map[string]any,
+	_ *[]caddyconfig.Warning,
 ) error {
-	// If experimental HTTP/3 is enabled, enable it on each server.
-	// We already know there won't be a conflict with serverOptions because
-	// we validated earlier that "experimental_http3" cannot be set at the same
-	// time as "servers"
-	if enableH3, ok := options["experimental_http3"].(bool); ok && enableH3 {
-		*warnings = append(*warnings, caddyconfig.Warning{Message: "the 'experimental_http3' global option is deprecated, please use the 'servers > protocol > experimental_http3' option instead"})
-		for _, srv := range servers {
-			srv.ExperimentalHTTP3 = true
-		}
-	}
-
 	serverOpts, ok := options["servers"].([]serverOptions)
 	if !ok {
 		return nil
 	}
 
-	for _, server := range servers {
-		// find the options that apply to this server
-		opts := func() *serverOptions {
-			for _, entry := range serverOpts {
-				if entry.ListenerAddress == "" {
-					return &entry
-				}
-				for _, listener := range server.Listen {
-					if entry.ListenerAddress == listener {
-						return &entry
-					}
-				}
-			}
-			return nil
-		}()
-
-		// if none apply, then move to the next server
-		if opts == nil {
+	// check for duplicate names, which would clobber the config
+	existingNames := map[string]bool{}
+	for _, opts := range serverOpts {
+		if opts.Name == "" {
 			continue
 		}
+		if existingNames[opts.Name] {
+			return fmt.Errorf("cannot use duplicate server name '%s'", opts.Name)
+		}
+		existingNames[opts.Name] = true
+	}
+
+	// collect the server name overrides
+	nameReplacements := map[string]string{}
+
+	for key, server := range servers {
+		// find the options that apply to this server
+		optsIndex := slices.IndexFunc(serverOpts, func(s serverOptions) bool {
+			return s.ListenerAddress == "" || slices.Contains(server.Listen, s.ListenerAddress)
+		})
+
+		// if none apply, then move to the next server
+		if optsIndex == -1 {
+			continue
+		}
+		opts := serverOpts[optsIndex]
 
 		// set all the options
 		server.ListenerWrappersRaw = opts.ListenerWrappersRaw
@@ -228,16 +306,38 @@ func applyServerOptions(
 		server.ReadHeaderTimeout = opts.ReadHeaderTimeout
 		server.WriteTimeout = opts.WriteTimeout
 		server.IdleTimeout = opts.IdleTimeout
+		server.KeepAliveInterval = opts.KeepAliveInterval
 		server.MaxHeaderBytes = opts.MaxHeaderBytes
-		server.AllowH2C = opts.AllowH2C
-		server.ExperimentalHTTP3 = opts.ExperimentalHTTP3
+		server.EnableFullDuplex = opts.EnableFullDuplex
+		server.Protocols = opts.Protocols
 		server.StrictSNIHost = opts.StrictSNIHost
+		server.TrustedProxiesRaw = opts.TrustedProxiesRaw
+		server.ClientIPHeaders = opts.ClientIPHeaders
+		server.TrustedProxiesStrict = opts.TrustedProxiesStrict
+		server.Metrics = opts.Metrics
 		if opts.ShouldLogCredentials {
 			if server.Logs == nil {
-				server.Logs = &caddyhttp.ServerLogConfig{}
+				server.Logs = new(caddyhttp.ServerLogConfig)
 			}
 			server.Logs.ShouldLogCredentials = opts.ShouldLogCredentials
 		}
+		if opts.Trace {
+			// TODO: THIS IS EXPERIMENTAL (MAY 2024)
+			if server.Logs == nil {
+				server.Logs = new(caddyhttp.ServerLogConfig)
+			}
+			server.Logs.Trace = opts.Trace
+		}
+
+		if opts.Name != "" {
+			nameReplacements[key] = opts.Name
+		}
+	}
+
+	// rename the servers if marked to do so
+	for old, new := range nameReplacements {
+		servers[new] = servers[old]
+		delete(servers, old)
 	}
 
 	return nil

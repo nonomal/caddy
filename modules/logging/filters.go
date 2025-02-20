@@ -23,10 +23,13 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
+
+	"go.uber.org/zap/zapcore"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	"go.uber.org/zap/zapcore"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 func init() {
@@ -75,9 +78,11 @@ func hash(s string) string {
 }
 
 // HashFilter is a Caddy log field filter that
-// replaces the field with the initial 4 bytes of the SHA-256 hash of the content.
-type HashFilter struct {
-}
+// replaces the field with the initial 4 bytes
+// of the SHA-256 hash of the content. Operates
+// on string fields, or on arrays of strings
+// where each string is hashed.
+type HashFilter struct{}
 
 // CaddyModule returns the Caddy module information.
 func (HashFilter) CaddyModule() caddy.ModuleInfo {
@@ -94,7 +99,16 @@ func (f *HashFilter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 // Filter filters the input field with the replacement value.
 func (f *HashFilter) Filter(in zapcore.Field) zapcore.Field {
-	in.String = hash(in.String)
+	if array, ok := in.Interface.(caddyhttp.LoggableStringArray); ok {
+		newArray := make(caddyhttp.LoggableStringArray, len(array))
+		for i, s := range array {
+			newArray[i] = hash(s)
+		}
+		in.Interface = newArray
+	} else {
+		in.String = hash(in.String)
+	}
+
 	return in
 }
 
@@ -114,10 +128,9 @@ func (ReplaceFilter) CaddyModule() caddy.ModuleInfo {
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (f *ReplaceFilter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if d.NextArg() {
-			f.Value = d.Val()
-		}
+	d.Next() // consume filter name
+	if d.NextArg() {
+		f.Value = d.Val()
 	}
 	return nil
 }
@@ -130,7 +143,10 @@ func (f *ReplaceFilter) Filter(in zapcore.Field) zapcore.Field {
 }
 
 // IPMaskFilter is a Caddy log field filter that
-// masks IP addresses.
+// masks IP addresses in a string, or in an array
+// of strings. The string may be a comma separated
+// list of IP addresses, where all of the values
+// will be masked.
 type IPMaskFilter struct {
 	// The IPv4 mask, as an subnet size CIDR.
 	IPv4MaskRaw int `json:"ipv4_cidr,omitempty"`
@@ -152,32 +168,52 @@ func (IPMaskFilter) CaddyModule() caddy.ModuleInfo {
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (m *IPMaskFilter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		for d.NextBlock(0) {
-			switch d.Val() {
-			case "ipv4":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				val, err := strconv.Atoi(d.Val())
-				if err != nil {
-					return d.Errf("error parsing %s: %v", d.Val(), err)
-				}
-				m.IPv4MaskRaw = val
+	d.Next() // consume filter name
 
-			case "ipv6":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				val, err := strconv.Atoi(d.Val())
-				if err != nil {
-					return d.Errf("error parsing %s: %v", d.Val(), err)
-				}
-				m.IPv6MaskRaw = val
+	args := d.RemainingArgs()
+	if len(args) > 2 {
+		return d.Errf("too many arguments")
+	}
+	if len(args) > 0 {
+		val, err := strconv.Atoi(args[0])
+		if err != nil {
+			return d.Errf("error parsing %s: %v", args[0], err)
+		}
+		m.IPv4MaskRaw = val
 
-			default:
-				return d.Errf("unrecognized subdirective %s", d.Val())
+		if len(args) > 1 {
+			val, err := strconv.Atoi(args[1])
+			if err != nil {
+				return d.Errf("error parsing %s: %v", args[1], err)
 			}
+			m.IPv6MaskRaw = val
+		}
+	}
+
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "ipv4":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			val, err := strconv.Atoi(d.Val())
+			if err != nil {
+				return d.Errf("error parsing %s: %v", d.Val(), err)
+			}
+			m.IPv4MaskRaw = val
+
+		case "ipv6":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			val, err := strconv.Atoi(d.Val())
+			if err != nil {
+				return d.Errf("error parsing %s: %v", d.Val(), err)
+			}
+			m.IPv6MaskRaw = val
+
+		default:
+			return d.Errf("unrecognized subdirective %s", d.Val())
 		}
 	}
 	return nil
@@ -204,25 +240,45 @@ func (m *IPMaskFilter) Provision(ctx caddy.Context) error {
 
 // Filter filters the input field.
 func (m IPMaskFilter) Filter(in zapcore.Field) zapcore.Field {
-	host, port, err := net.SplitHostPort(in.String)
-	if err != nil {
-		host = in.String // assume whole thing was IP address
-	}
-	ipAddr := net.ParseIP(host)
-	if ipAddr == nil {
-		return in
-	}
-	mask := m.v4Mask
-	if ipAddr.To4() == nil {
-		mask = m.v6Mask
-	}
-	masked := ipAddr.Mask(mask)
-	if port == "" {
-		in.String = masked.String()
+	if array, ok := in.Interface.(caddyhttp.LoggableStringArray); ok {
+		newArray := make(caddyhttp.LoggableStringArray, len(array))
+		for i, s := range array {
+			newArray[i] = m.mask(s)
+		}
+		in.Interface = newArray
 	} else {
-		in.String = net.JoinHostPort(masked.String(), port)
+		in.String = m.mask(in.String)
 	}
+
 	return in
+}
+
+func (m IPMaskFilter) mask(s string) string {
+	output := ""
+	for _, value := range strings.Split(s, ",") {
+		value = strings.TrimSpace(value)
+		host, port, err := net.SplitHostPort(value)
+		if err != nil {
+			host = value // assume whole thing was IP address
+		}
+		ipAddr := net.ParseIP(host)
+		if ipAddr == nil {
+			output += value + ", "
+			continue
+		}
+		mask := m.v4Mask
+		if ipAddr.To4() == nil {
+			mask = m.v6Mask
+		}
+		masked := ipAddr.Mask(mask)
+		if port == "" {
+			output += masked.String() + ", "
+			continue
+		}
+
+		output += net.JoinHostPort(masked.String(), port) + ", "
+	}
+	return strings.TrimSuffix(output, ", ")
 }
 
 type filterAction string
@@ -291,54 +347,67 @@ func (QueryFilter) CaddyModule() caddy.ModuleInfo {
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (m *QueryFilter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		for d.NextBlock(0) {
-			qfa := queryFilterAction{}
-			switch d.Val() {
-			case "replace":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-
-				qfa.Type = replaceAction
-				qfa.Parameter = d.Val()
-
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				qfa.Value = d.Val()
-
-			case "hash":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-
-				qfa.Type = hashAction
-				qfa.Parameter = d.Val()
-
-			case "delete":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-
-				qfa.Type = deleteAction
-				qfa.Parameter = d.Val()
-
-			default:
-				return d.Errf("unrecognized subdirective %s", d.Val())
+	d.Next() // consume filter name
+	for d.NextBlock(0) {
+		qfa := queryFilterAction{}
+		switch d.Val() {
+		case "replace":
+			if !d.NextArg() {
+				return d.ArgErr()
 			}
 
-			m.Actions = append(m.Actions, qfa)
+			qfa.Type = replaceAction
+			qfa.Parameter = d.Val()
+
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			qfa.Value = d.Val()
+
+		case "hash":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+
+			qfa.Type = hashAction
+			qfa.Parameter = d.Val()
+
+		case "delete":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+
+			qfa.Type = deleteAction
+			qfa.Parameter = d.Val()
+
+		default:
+			return d.Errf("unrecognized subdirective %s", d.Val())
 		}
+
+		m.Actions = append(m.Actions, qfa)
 	}
 	return nil
 }
 
 // Filter filters the input field.
 func (m QueryFilter) Filter(in zapcore.Field) zapcore.Field {
-	u, err := url.Parse(in.String)
+	if array, ok := in.Interface.(caddyhttp.LoggableStringArray); ok {
+		newArray := make(caddyhttp.LoggableStringArray, len(array))
+		for i, s := range array {
+			newArray[i] = m.processQueryString(s)
+		}
+		in.Interface = newArray
+	} else {
+		in.String = m.processQueryString(in.String)
+	}
+
+	return in
+}
+
+func (m QueryFilter) processQueryString(s string) string {
+	u, err := url.Parse(s)
 	if err != nil {
-		return in
+		return s
 	}
 
 	q := u.Query()
@@ -360,9 +429,7 @@ func (m QueryFilter) Filter(in zapcore.Field) zapcore.Field {
 	}
 
 	u.RawQuery = q.Encode()
-	in.String = u.String()
-
-	return in
+	return u.String()
 }
 
 type cookieFilterAction struct {
@@ -411,52 +478,57 @@ func (CookieFilter) CaddyModule() caddy.ModuleInfo {
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (m *CookieFilter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		for d.NextBlock(0) {
-			cfa := cookieFilterAction{}
-			switch d.Val() {
-			case "replace":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-
-				cfa.Type = replaceAction
-				cfa.Name = d.Val()
-
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				cfa.Value = d.Val()
-
-			case "hash":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-
-				cfa.Type = hashAction
-				cfa.Name = d.Val()
-
-			case "delete":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-
-				cfa.Type = deleteAction
-				cfa.Name = d.Val()
-
-			default:
-				return d.Errf("unrecognized subdirective %s", d.Val())
+	d.Next() // consume filter name
+	for d.NextBlock(0) {
+		cfa := cookieFilterAction{}
+		switch d.Val() {
+		case "replace":
+			if !d.NextArg() {
+				return d.ArgErr()
 			}
 
-			m.Actions = append(m.Actions, cfa)
+			cfa.Type = replaceAction
+			cfa.Name = d.Val()
+
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			cfa.Value = d.Val()
+
+		case "hash":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+
+			cfa.Type = hashAction
+			cfa.Name = d.Val()
+
+		case "delete":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+
+			cfa.Type = deleteAction
+			cfa.Name = d.Val()
+
+		default:
+			return d.Errf("unrecognized subdirective %s", d.Val())
 		}
+
+		m.Actions = append(m.Actions, cfa)
 	}
 	return nil
 }
 
 // Filter filters the input field.
 func (m CookieFilter) Filter(in zapcore.Field) zapcore.Field {
-	originRequest := http.Request{Header: http.Header{"Cookie": []string{in.String}}}
+	cookiesSlice, ok := in.Interface.(caddyhttp.LoggableStringArray)
+	if !ok {
+		return in
+	}
+
+	// using a dummy Request to make use of the Cookies() function to parse it
+	originRequest := http.Request{Header: http.Header{"Cookie": cookiesSlice}}
 	cookies := originRequest.Cookies()
 	transformedRequest := http.Request{Header: make(http.Header)}
 
@@ -486,13 +558,16 @@ OUTER:
 		transformedRequest.AddCookie(c)
 	}
 
-	in.String = transformedRequest.Header.Get("Cookie")
+	in.Interface = caddyhttp.LoggableStringArray(transformedRequest.Header["Cookie"])
 
 	return in
 }
 
 // RegexpFilter is a Caddy log field filter that
-// replaces the field matching the provided regexp with the indicated string.
+// replaces the field matching the provided regexp
+// with the indicated string. If the field is an
+// array of strings, each of them will have the
+// regexp replacement applied.
 type RegexpFilter struct {
 	// The regular expression pattern defining what to replace.
 	RawRegexp string `json:"regexp,omitempty"`
@@ -513,13 +588,12 @@ func (RegexpFilter) CaddyModule() caddy.ModuleInfo {
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (f *RegexpFilter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if d.NextArg() {
-			f.RawRegexp = d.Val()
-		}
-		if d.NextArg() {
-			f.Value = d.Val()
-		}
+	d.Next() // consume filter name
+	if d.NextArg() {
+		f.RawRegexp = d.Val()
+	}
+	if d.NextArg() {
+		f.Value = d.Val()
 	}
 	return nil
 }
@@ -538,7 +612,15 @@ func (m *RegexpFilter) Provision(ctx caddy.Context) error {
 
 // Filter filters the input field with the replacement value if it matches the regexp.
 func (f *RegexpFilter) Filter(in zapcore.Field) zapcore.Field {
-	in.String = f.regexp.ReplaceAllString(in.String, f.Value)
+	if array, ok := in.Interface.(caddyhttp.LoggableStringArray); ok {
+		newArray := make(caddyhttp.LoggableStringArray, len(array))
+		for i, s := range array {
+			newArray[i] = f.regexp.ReplaceAllString(s, f.Value)
+		}
+		in.Interface = newArray
+	} else {
+		in.String = f.regexp.ReplaceAllString(in.String, f.Value)
+	}
 
 	return in
 }
@@ -559,17 +641,15 @@ func (RenameFilter) CaddyModule() caddy.ModuleInfo {
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
 func (f *RenameFilter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if d.NextArg() {
-			f.Name = d.Val()
-		}
+	d.Next() // consume filter name
+	if d.NextArg() {
+		f.Name = d.Val()
 	}
 	return nil
 }
 
 // Filter renames the input field with the replacement name.
 func (f *RenameFilter) Filter(in zapcore.Field) zapcore.Field {
-	in.Type = zapcore.StringType
 	in.Key = f.Name
 	return in
 }
